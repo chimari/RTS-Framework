@@ -7,9 +7,10 @@ immutable result object.  No RTS detection or image statistics are performed.
 
 from __future__ import annotations
 
-__version__ = "1.0.0"
+__version__ = "1.2.0"
 
 from dataclasses import dataclass
+import json
 from pathlib import Path
 from typing import Callable, Literal
 
@@ -86,6 +87,103 @@ class Step01Result:
 
         return "\n".join(lines)
 
+
+
+def write_report(
+    result: Step01Result,
+    output_path: str | Path,
+    *,
+    indent: int | None = 2,
+) -> Path:
+    """Write a machine-readable Step 01 report as UTF-8 JSON.
+
+    The report intentionally omits a generation timestamp so that identical
+    validation results produce stable, reproducible JSON content.
+
+    Parameters
+    ----------
+    result
+        Result returned by :func:`prepare_dataset`.
+    output_path
+        Destination JSON path. Parent directories are created automatically.
+    indent
+        JSON indentation. Use ``None`` for compact output.
+
+    Returns
+    -------
+    Path
+        The destination path.
+
+    Raises
+    ------
+    Step01Error
+        If the destination cannot be written.
+    """
+    path = Path(output_path)
+    payload = _build_report_payload(result)
+
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("w", encoding="utf-8", newline="\n") as stream:
+            json.dump(
+                payload,
+                stream,
+                ensure_ascii=False,
+                indent=indent,
+                sort_keys=True,
+            )
+            stream.write("\n")
+    except (OSError, TypeError, ValueError) as exc:
+        raise Step01Error(f"Unable to write Step 01 report: {path}: {exc}") from exc
+
+    return path
+
+
+def _build_report_payload(result: Step01Result) -> dict[str, object]:
+    """Convert one Step 01 result into the stable JSON report schema."""
+    manifest_source = result.manifest.source_path
+    frame_root = result.manifest.frame_root
+
+    return {
+        "schema_version": "1.0",
+        "step": "step01_prepare_dataset",
+        "step_version": __version__,
+        "status": "passed" if result.valid else "failed",
+        "validation_mode": result.validation_mode,
+        "manifest": {
+            "source_path": (
+                str(manifest_source) if manifest_source is not None else None
+            ),
+            "frame_root": str(frame_root) if frame_root is not None else None,
+            "frame_count": result.manifest.n_frames,
+            "dataset_count": result.manifest.n_datasets,
+        },
+        "counts": {
+            "frames_checked": result.n_checked_images,
+            "manifest_errors": result.manifest_validation.error_count,
+            "manifest_warnings": result.manifest_validation.warning_count,
+            "image_errors": len(result.image_issues),
+        },
+        "manifest_issues": [
+            {
+                "severity": issue.severity,
+                "issue_type": issue.issue_type,
+                "detail": issue.detail,
+                "manifest_row": issue.manifest_row,
+                "dataset": issue.dataset,
+            }
+            for issue in result.manifest_validation.issues
+        ],
+        "image_issues": [
+            {
+                "manifest_row": issue.manifest_row,
+                "dataset": issue.dataset,
+                "filepath": str(issue.filepath),
+                "detail": issue.detail,
+            }
+            for issue in result.image_issues
+        ],
+    }
 
 def prepare_dataset(
     manifest_path: str | Path,
