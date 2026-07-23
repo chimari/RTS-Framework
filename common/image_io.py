@@ -2,8 +2,8 @@
 Image input/output helpers for the RTS Framework.
 
 This implementation provides source normalization, image-format detection,
-two-dimensional FITS image reading, and image validation. RAW reading and
-standalone shape inspection will be added in later milestones.
+two-dimensional FITS image reading, image-shape inspection, and image
+validation. RAW reading will be added in a later milestone.
 
 Public API
 ----------
@@ -11,12 +11,13 @@ Public API
 - ImageSource
 - detect_format
 - read_image
+- get_image_shape
 - validate_image
 """
 
 from __future__ import annotations
 
-__version__ = "0.4.0"
+__version__ = "0.5.0"
 
 from enum import Enum
 from pathlib import Path
@@ -164,6 +165,39 @@ def read_image(source: ImageSource) -> np.ndarray:
 
 
 
+
+def get_image_shape(source: ImageSource) -> tuple[int, int]:
+    """
+    Return image shape as ``(height, width)`` without loading FITS pixels.
+
+    Singleton axes are removed before the dimensionality check, matching the
+    behavior of :func:`read_image`. For example, ``(1, height, width)`` becomes
+    ``(height, width)``.
+    """
+    path = _normalize_source(source)
+
+    if not path.is_file():
+        raise ImageIOError(f"Image file does not exist: {path}")
+
+    image_format = detect_format(path)
+
+    if image_format is ImageFormat.FITS:
+        shape = _get_fits_shape(path)
+    else:
+        raise NotImplementedError(
+            f"RAW image shape inspection is not implemented yet: {path}"
+        )
+
+    squeezed_shape = tuple(dimension for dimension in shape if dimension != 1)
+
+    if len(squeezed_shape) != 2:
+        raise ImageIOError(
+            "Image must be two-dimensional after removing singleton axes: "
+            f"path={path}, shape={shape}"
+        )
+
+    return squeezed_shape
+
 def validate_image(source: ImageSource) -> None:
     """
     Validate that an image can be read as a two-dimensional array.
@@ -222,6 +256,27 @@ def validate_image(source: ImageSource) -> None:
                 f"path={source.filepath}, "
                 f"expected={expected_dtype}, actual={image.dtype}"
             )
+
+
+def _get_fits_shape(path: Path) -> tuple[int, ...]:
+    """Return the first non-empty FITS image shape without loading pixel data."""
+    try:
+        with fits.open(
+            path,
+            mode="readonly",
+            memmap=True,
+            do_not_scale_image_data=True,
+        ) as hdul:
+            for hdu in hdul:
+                shape = tuple(getattr(hdu, "shape", ()) or ())
+                if shape:
+                    return shape
+    except (OSError, ValueError, TypeError) as exc:
+        raise ImageIOError(
+            f"Unable to inspect FITS image shape: {path}: {exc}"
+        ) from exc
+
+    raise ImageIOError(f"FITS file contains no image data: {path}")
 
 def _read_fits(path: Path) -> np.ndarray:
     """Read image data from the first FITS HDU containing an array."""

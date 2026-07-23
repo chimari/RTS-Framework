@@ -49,14 +49,14 @@ def main() -> int:
     print(f"image_io.py version : {getattr(image_io, '__version__', '(not defined)')}")
     print()
 
-    print("[1/10] Source normalization")
+    print("[1/13] Source normalization")
     normalized = image_io._normalize_source(source)
     print(f"   Input type : {type(source).__name__}")
     print(f"   Path       : {normalized}")
     print("   Result     : PASS")
     print()
 
-    print("[2/10] Format detection")
+    print("[2/13] Format detection")
     detected = image_io.detect_format(source)
     print(f"   Format     : {detected.name}")
     print(f"   Value      : {detected.value}")
@@ -71,7 +71,7 @@ def main() -> int:
     print("   Result     : PASS")
     print()
 
-    print("[3/10] Image reading from Path")
+    print("[3/13] Image reading from Path")
     try:
         image = image_io.read_image(source)
 
@@ -101,7 +101,7 @@ def main() -> int:
     print("   Result     : PASS")
     print()
 
-    print("[4/10] Image reading from FrameRecord")
+    print("[4/13] Image reading from FrameRecord")
     frame = FrameRecord(
         manifest_row=0,
         dataset="smoke-test",
@@ -135,12 +135,33 @@ def main() -> int:
     print("   Result     : PASS")
     print()
 
-    print("[5/10] Image validation from Path")
+    print("[5/13] Image shape from Path")
+    path_shape = image_io.get_image_shape(source)
+    print(f"   Shape      : {path_shape}")
+    print(f"   Match read : {path_shape == image.shape}")
+    if path_shape != image.shape:
+        print("   Result     : FAIL")
+        return 1
+    print("   Result     : PASS")
+    print()
+
+    print("[6/13] Image shape from FrameRecord")
+    frame_shape = image_io.get_image_shape(frame)
+    print(f"   Source     : {type(frame).__name__}")
+    print(f"   Shape      : {frame_shape}")
+    print(f"   Match Path : {frame_shape == path_shape}")
+    if frame_shape != path_shape:
+        print("   Result     : FAIL")
+        return 1
+    print("   Result     : PASS")
+    print()
+
+    print("[7/13] Image validation from Path")
     image_io.validate_image(source)
     print("   Result     : PASS")
     print()
 
-    print("[6/10] Image validation from FrameRecord")
+    print("[8/13] Image validation from FrameRecord")
     image_io.validate_image(frame)
     print(f"   Geometry   : {frame.image_width} x {frame.image_height}")
     print(f"   dtype      : {frame.pixel_dtype}")
@@ -168,7 +189,7 @@ def main() -> int:
         print()
         return False
 
-    print("[7/10] Missing file rejection")
+    print("[9/13] Missing file rejection")
     missing_path = source.with_name(f"{source.name}.missing")
     if not expect_image_io_error(
         "missing file",
@@ -176,7 +197,7 @@ def main() -> int:
     ):
         return 1
 
-    print("[8/10] Shape mismatch rejection")
+    print("[10/13] Shape mismatch rejection")
     wrong_shape_frame = FrameRecord(
         manifest_row=1,
         dataset="smoke-test",
@@ -202,7 +223,7 @@ def main() -> int:
     ):
         return 1
 
-    print("[9/10] dtype mismatch rejection")
+    print("[11/13] dtype mismatch rejection")
     wrong_dtype = "float32" if image.dtype != np.dtype("float32") else "uint16"
     wrong_dtype_frame = FrameRecord(
         manifest_row=2,
@@ -229,7 +250,7 @@ def main() -> int:
     ):
         return 1
 
-    print("[10/10] Incomplete geometry rejection")
+    print("[12/13] Incomplete geometry rejection")
     incomplete_geometry_frame = FrameRecord(
         manifest_row=3,
         dataset="smoke-test",
@@ -255,8 +276,16 @@ def main() -> int:
     ):
         return 1
 
+    print("[13/13] Missing-file shape rejection")
+    missing_shape_path = source.with_name(f"{source.name}.shape-missing")
+    if not expect_image_io_error(
+        "missing shape file",
+        lambda: image_io.get_image_shape(missing_shape_path),
+    ):
+        return 1
+
     print("=" * 72)
-    print("FINISHED: image_io validation tests passed")
+    print("FINISHED: image_io shape and validation tests passed")
     print("=" * 72)
     return 0
 
