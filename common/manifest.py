@@ -16,9 +16,11 @@ data model and validation API have been reviewed in actual use.
 
 from __future__ import annotations
 
-__version__ = "2.0.0-dev"
+__version__ = "2.0.0"
 
 import csv
+import math
+
 from collections import defaultdict
 from dataclasses import dataclass
 from pathlib import Path
@@ -860,16 +862,29 @@ class FrameManifest:
                     )
                 )
 
-            if frame.exposure_s <= 0.0:
+            if not math.isfinite(frame.exposure_s):
                 issues.append(
                     ManifestIssue(
                         "error",
                         "invalid_exposure",
-                        f"exposure_s must be positive, got {frame.exposure_s}.",
+                        f"exposure_s must be finite, got {frame.exposure_s}.",
                         row,
                         dataset,
                     )
                 )
+            
+                
+            elif frame.exposure_s < 0.0:
+                issues.append(
+                    ManifestIssue(
+                        "error",
+                        "invalid_exposure",
+                        f"exposure_s must be zero or positive, got {frame.exposure_s}.",
+                        row,
+                        dataset,
+                    )
+                )
+            
 
             if frame.filename and frame.filepath.name != frame.filename:
                 issues.append(
