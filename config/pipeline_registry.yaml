@@ -1,0 +1,39 @@
+pipeline:
+  name: IMX811_RTS
+  registry_version: 1
+
+migration_policy:
+  preserve_legacy_behavior: true
+  refactor_only_after_smoke_test: true
+
+steps:
+  step01: {status: missing, script: null, version: null}
+  step02: {status: missing, script: null, version: null}
+  step03: {status: missing, script: null, version: null}
+  step04: {status: missing, script: null, version: null}
+  step05: {status: missing, script: null, version: null}
+  step06:
+    status: located
+    script: 06_detect_histogram_states_by_temperature_bin_v6_2.py
+    version: 6.2.0
+  step07:
+    status: located_version_to_confirm
+    script: 07_assign_states_and_analyze_transitions.py
+    version: null
+  step08:
+    status: located
+    script: 08_measure_state_transition_statistics_v8_0_2.py
+    version: 8.0.2
+  step08_5:
+    status: located
+    script: 08_5_generate_visual_judgment_report_v8_5_0.py
+    version: 8.5.0
+  step09:
+    status: latest_code_needed
+    script: 09_classify_rts_and_generate_dictionary_v9_1_0.py
+    version: 9.1.0
+  step09_qa:
+    status: located
+    script: Step09_QA_Report_v1_0_0.py
+    version: 1.0.0
+  step10: {status: missing, script: null, version: null}
