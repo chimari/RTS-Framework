@@ -20,3 +20,40 @@ git branch -M main
 git remote add origin <GITHUB_REPOSITORY_URL>
 git push -u origin main
 ```
+
+
+# Planning Pipeline Framework
+
+Frame Index
+    │
+    ▼
+Raw Statistics
+    │
+    ▼
+Candidate Extraction
+    │
+    ▼
+Time Series
+    │
+    ▼
+Histogram Analysis
+    │
+    ▼
+State Assignment
+    │
+    ▼
+Transition Statistics
+    │
+    ▼
+RTS Classification
+    │
+    ├── Dictionary
+    ├── QA Report
+    └── (Future)
+         Reviewer
+              │
+              ▼
+        Learning Dataset
+              │
+              ▼
+      Threshold Optimizer
