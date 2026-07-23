@@ -26,7 +26,7 @@ from common.manifest import FrameRecord  # noqa: E402
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Test image normalization, format detection, and reading."
+        description="Test image normalization, format detection, reading, and validation."
     )
     parser.add_argument("image_path", type=Path, help="Image file to inspect.")
     parser.add_argument(
@@ -49,14 +49,14 @@ def main() -> int:
     print(f"image_io.py version : {getattr(image_io, '__version__', '(not defined)')}")
     print()
 
-    print("[1/3] Source normalization")
+    print("[1/10] Source normalization")
     normalized = image_io._normalize_source(source)
     print(f"   Input type : {type(source).__name__}")
     print(f"   Path       : {normalized}")
     print("   Result     : PASS")
     print()
 
-    print("[2/3] Format detection")
+    print("[2/10] Format detection")
     detected = image_io.detect_format(source)
     print(f"   Format     : {detected.name}")
     print(f"   Value      : {detected.value}")
@@ -71,7 +71,7 @@ def main() -> int:
     print("   Result     : PASS")
     print()
 
-    print("[3/4] Image reading from Path")
+    print("[3/10] Image reading from Path")
     try:
         image = image_io.read_image(source)
 
@@ -101,7 +101,7 @@ def main() -> int:
     print("   Result     : PASS")
     print()
 
-    print("[4/4] Image reading from FrameRecord")
+    print("[4/10] Image reading from FrameRecord")
     frame = FrameRecord(
         manifest_row=0,
         dataset="smoke-test",
@@ -116,6 +116,10 @@ def main() -> int:
         exposure_s=1.0,
         filename=source.name,
         filepath=source,
+        image_width=image.shape[1],
+        image_height=image.shape[0],
+        pixel_dtype=str(image.dtype),
+        byte_order="not-applicable",
     )
 
     frame_image = image_io.read_image(frame)
@@ -131,8 +135,128 @@ def main() -> int:
     print("   Result     : PASS")
     print()
 
+    print("[5/10] Image validation from Path")
+    image_io.validate_image(source)
+    print("   Result     : PASS")
+    print()
+
+    print("[6/10] Image validation from FrameRecord")
+    image_io.validate_image(frame)
+    print(f"   Geometry   : {frame.image_width} x {frame.image_height}")
+    print(f"   dtype      : {frame.pixel_dtype}")
+    print("   Metadata   : MATCH")
+    print("   Result     : PASS")
+    print()
+
+    def expect_image_io_error(label: str, callback) -> bool:
+        try:
+            callback()
+        except image_io.ImageIOError as exc:
+            print(f"   Error      : {exc}")
+            print("   Result     : PASS")
+            print()
+            return True
+        except Exception as exc:
+            print(
+                "   Result     : FAIL "
+                f"(expected ImageIOError, got {type(exc).__name__}: {exc})"
+            )
+            print()
+            return False
+
+        print("   Result     : FAIL (ImageIOError was not raised)")
+        print()
+        return False
+
+    print("[7/10] Missing file rejection")
+    missing_path = source.with_name(f"{source.name}.missing")
+    if not expect_image_io_error(
+        "missing file",
+        lambda: image_io.validate_image(missing_path),
+    ):
+        return 1
+
+    print("[8/10] Shape mismatch rejection")
+    wrong_shape_frame = FrameRecord(
+        manifest_row=1,
+        dataset="smoke-test",
+        directory=str(source.parent),
+        environment="test",
+        frame_index=0,
+        n_frames=1,
+        temperature_C=0.0,
+        temperature_start_C=0.0,
+        temperature_end_C=0.0,
+        temperature_fraction=0.0,
+        exposure_s=1.0,
+        filename=source.name,
+        filepath=source,
+        image_width=image.shape[1] + 1,
+        image_height=image.shape[0],
+        pixel_dtype=str(image.dtype),
+        byte_order="not-applicable",
+    )
+    if not expect_image_io_error(
+        "shape mismatch",
+        lambda: image_io.validate_image(wrong_shape_frame),
+    ):
+        return 1
+
+    print("[9/10] dtype mismatch rejection")
+    wrong_dtype = "float32" if image.dtype != np.dtype("float32") else "uint16"
+    wrong_dtype_frame = FrameRecord(
+        manifest_row=2,
+        dataset="smoke-test",
+        directory=str(source.parent),
+        environment="test",
+        frame_index=0,
+        n_frames=1,
+        temperature_C=0.0,
+        temperature_start_C=0.0,
+        temperature_end_C=0.0,
+        temperature_fraction=0.0,
+        exposure_s=1.0,
+        filename=source.name,
+        filepath=source,
+        image_width=image.shape[1],
+        image_height=image.shape[0],
+        pixel_dtype=wrong_dtype,
+        byte_order="not-applicable",
+    )
+    if not expect_image_io_error(
+        "dtype mismatch",
+        lambda: image_io.validate_image(wrong_dtype_frame),
+    ):
+        return 1
+
+    print("[10/10] Incomplete geometry rejection")
+    incomplete_geometry_frame = FrameRecord(
+        manifest_row=3,
+        dataset="smoke-test",
+        directory=str(source.parent),
+        environment="test",
+        frame_index=0,
+        n_frames=1,
+        temperature_C=0.0,
+        temperature_start_C=0.0,
+        temperature_end_C=0.0,
+        temperature_fraction=0.0,
+        exposure_s=1.0,
+        filename=source.name,
+        filepath=source,
+        image_width=image.shape[1],
+        image_height=None,
+        pixel_dtype=str(image.dtype),
+        byte_order="not-applicable",
+    )
+    if not expect_image_io_error(
+        "incomplete geometry",
+        lambda: image_io.validate_image(incomplete_geometry_frame),
+    ):
+        return 1
+
     print("=" * 72)
-    print("FINISHED: image_io read-image smoke test passed")
+    print("FINISHED: image_io validation tests passed")
     print("=" * 72)
     return 0
 

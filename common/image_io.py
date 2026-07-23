@@ -2,8 +2,8 @@
 Image input/output helpers for the RTS Framework.
 
 This implementation provides source normalization, image-format detection,
-and two-dimensional FITS image reading. RAW reading, shape inspection, and
-validation will be added in later milestones.
+two-dimensional FITS image reading, and image validation. RAW reading and
+standalone shape inspection will be added in later milestones.
 
 Public API
 ----------
@@ -11,11 +11,12 @@ Public API
 - ImageSource
 - detect_format
 - read_image
+- validate_image
 """
 
 from __future__ import annotations
 
-__version__ = "0.3.0"
+__version__ = "0.4.0"
 
 from enum import Enum
 from pathlib import Path
@@ -161,6 +162,66 @@ def read_image(source: ImageSource) -> np.ndarray:
 
     return image
 
+
+
+def validate_image(source: ImageSource) -> None:
+    """
+    Validate that an image can be read as a two-dimensional array.
+
+    When ``source`` is a :class:`FrameRecord`, optional image metadata are also
+    checked against the actual image:
+
+    - ``image_width`` and ``image_height``
+    - ``pixel_dtype``
+
+    Parameters
+    ----------
+    source
+        A path string, ``Path``, or ``FrameRecord``.
+
+    Raises
+    ------
+    ImageIOError
+        If the file is missing, unreadable, unsupported, not two-dimensional,
+        or inconsistent with metadata stored in a ``FrameRecord``.
+    """
+    image = read_image(source)
+
+    if not isinstance(source, FrameRecord):
+        return
+
+    if source.image_width is not None or source.image_height is not None:
+        if source.image_width is None or source.image_height is None:
+            raise ImageIOError(
+                "FrameRecord image geometry is incomplete: "
+                f"path={source.filepath}, "
+                f"image_width={source.image_width}, "
+                f"image_height={source.image_height}"
+            )
+
+        expected_shape = (source.image_height, source.image_width)
+        if image.shape != expected_shape:
+            raise ImageIOError(
+                "Image shape does not match FrameRecord metadata: "
+                f"path={source.filepath}, "
+                f"expected={expected_shape}, actual={image.shape}"
+            )
+
+    if source.pixel_dtype is not None:
+        try:
+            expected_dtype = np.dtype(source.pixel_dtype)
+        except TypeError as exc:
+            raise ImageIOError(
+                "FrameRecord pixel_dtype is not NumPy-compatible: "
+                f"path={source.filepath}, pixel_dtype={source.pixel_dtype!r}"
+            ) from exc
+
+        if image.dtype != expected_dtype:
+            raise ImageIOError(
+                "Image dtype does not match FrameRecord metadata: "
+                f"path={source.filepath}, "
+                f"expected={expected_dtype}, actual={image.dtype}"
+            )
 
 def _read_fits(path: Path) -> np.ndarray:
     """Read image data from the first FITS HDU containing an array."""
