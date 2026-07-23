@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """
-Smoke test for common.image_io format detection.
+Smoke test for common.image_io FITS reading.
 
 Usage
 -----
-python tests/test_image_io.py IMAGE_PATH
+python tests/test_image_io.py IMAGE_PATH --expect fits
 """
 
 from __future__ import annotations
@@ -13,31 +13,27 @@ import argparse
 import sys
 from pathlib import Path
 
+import numpy as np
 
-# Allow direct execution from the repository's tests/ directory.
+
 REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
 if str(REPOSITORY_ROOT) not in sys.path:
     sys.path.insert(0, str(REPOSITORY_ROOT))
 
 from common import image_io  # noqa: E402
+from common.manifest import FrameRecord  # noqa: E402
 
-print(image_io.__file__)
-print(dir(image_io))
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Test image-source normalization and format detection."
+        description="Test image normalization, format detection, and reading."
     )
-    parser.add_argument(
-        "image_path",
-        type=Path,
-        help="FITS or RAW image file to inspect.",
-    )
+    parser.add_argument("image_path", type=Path, help="Image file to inspect.")
     parser.add_argument(
         "--expect",
         choices=("fits", "raw"),
         default=None,
-        help="Optional expected format. The test fails if it does not match.",
+        help="Optional expected format.",
     )
     return parser.parse_args()
 
@@ -49,17 +45,18 @@ def main() -> int:
     print("=" * 72)
     print("RTS Framework image_io smoke test")
     print("=" * 72)
+    print(f"image_io.py file    : {image_io.__file__}")
     print(f"image_io.py version : {getattr(image_io, '__version__', '(not defined)')}")
     print()
 
-    print("[1/2] Source normalization")
+    print("[1/3] Source normalization")
     normalized = image_io._normalize_source(source)
     print(f"   Input type : {type(source).__name__}")
     print(f"   Path       : {normalized}")
     print("   Result     : PASS")
     print()
 
-    print("[2/2] Format detection")
+    print("[2/3] Format detection")
     detected = image_io.detect_format(source)
     print(f"   Format     : {detected.name}")
     print(f"   Value      : {detected.value}")
@@ -73,8 +70,69 @@ def main() -> int:
 
     print("   Result     : PASS")
     print()
+
+    print("[3/4] Image reading from Path")
+    try:
+        image = image_io.read_image(source)
+
+    except Exception as exc:
+        import traceback
+
+        print(f"\nException: {type(exc).__name__}")
+        print(f"Message  : {exc}")
+        print("\nFull traceback:")
+        traceback.print_exc()
+
+        return 1
+
+    if not isinstance(image, np.ndarray):
+        print(f"   Result     : FAIL (returned {type(image).__name__}, not ndarray)")
+        return 1
+
+    if image.ndim != 2:
+        print(f"   Result     : FAIL (ndim={image.ndim}, shape={image.shape})")
+        return 1
+
+    print(f"   Type       : {type(image).__name__}")
+    print(f"   Shape      : {image.shape}")
+    print(f"   dtype      : {image.dtype}")
+    print(f"   Min        : {np.min(image)}")
+    print(f"   Max        : {np.max(image)}")
+    print("   Result     : PASS")
+    print()
+
+    print("[4/4] Image reading from FrameRecord")
+    frame = FrameRecord(
+        manifest_row=0,
+        dataset="smoke-test",
+        directory=str(source.parent),
+        environment="test",
+        frame_index=0,
+        n_frames=1,
+        temperature_C=0.0,
+        temperature_start_C=0.0,
+        temperature_end_C=0.0,
+        temperature_fraction=0.0,
+        exposure_s=1.0,
+        filename=source.name,
+        filepath=source,
+    )
+
+    frame_image = image_io.read_image(frame)
+
+    if not np.array_equal(frame_image, image):
+        print("   Result     : FAIL (FrameRecord result differs from Path result)")
+        return 1
+
+    print(f"   Source     : {type(frame).__name__}")
+    print(f"   Shape      : {frame_image.shape}")
+    print(f"   dtype      : {frame_image.dtype}")
+    print("   Match Path : YES")
+    print("   Result     : PASS")
+    print()
+
     print("=" * 72)
-    print("FINISHED: image_io smoke test passed")
+    print("FINISHED: image_io read-image smoke test passed")
     print("=" * 72)
     return 0
 

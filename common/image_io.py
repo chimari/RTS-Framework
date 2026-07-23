@@ -1,24 +1,28 @@
 """
 Image input/output helpers for the RTS Framework.
 
-This first implementation provides only source normalization and image-format
-detection. Image reading, shape inspection, and validation will be added after
-this API has been tested with real data.
+This implementation provides source normalization, image-format detection,
+and two-dimensional FITS image reading. RAW reading, shape inspection, and
+validation will be added in later milestones.
 
 Public API
 ----------
 - ImageFormat
 - ImageSource
 - detect_format
+- read_image
 """
 
 from __future__ import annotations
 
-__version__ = "0.2.0-dev"
+__version__ = "0.3.0"
 
 from enum import Enum
 from pathlib import Path
 from typing import TypeAlias
+
+import numpy as np
+from astropy.io import fits
 
 from .manifest import FrameRecord
 
@@ -109,6 +113,66 @@ def detect_format(source: ImageSource) -> ImageFormat:
 
     return ImageFormat.RAW
 
+
+
+def read_image(source: ImageSource) -> np.ndarray:
+    """
+    Read an image and return it as a two-dimensional NumPy array.
+
+    Parameters
+    ----------
+    source
+        A path string, ``Path``, or ``FrameRecord``.
+
+    Returns
+    -------
+    numpy.ndarray
+        A two-dimensional image array.
+
+    Raises
+    ------
+    ImageIOError
+        If the file does not exist, cannot be read, contains no image data, or
+        cannot be reduced to exactly two dimensions.
+    NotImplementedError
+        If RAW input is requested. RAW support will be added later.
+    """
+    path = _normalize_source(source)
+
+    if not path.is_file():
+        raise ImageIOError(f"Image file does not exist: {path}")
+
+    image_format = detect_format(path)
+
+    if image_format is ImageFormat.FITS:
+        image = _read_fits(path)
+    else:
+        raise NotImplementedError(
+            f"RAW image reading is not implemented yet: {path}"
+        )
+
+    image = np.squeeze(np.asarray(image))
+
+    if image.ndim != 2:
+        raise ImageIOError(
+            "Image must be two-dimensional after removing singleton axes: "
+            f"path={path}, shape={image.shape}"
+        )
+
+    return image
+
+
+def _read_fits(path: Path) -> np.ndarray:
+    """Read image data from the first FITS HDU containing an array."""
+    try:
+        with fits.open(path, mode="readonly", memmap=False) as hdul:
+            for hdu in hdul:
+                if hdu.data is not None:
+                    return np.asarray(hdu.data)
+    except (OSError, ValueError, TypeError) as exc:
+        raise ImageIOError(f"Unable to read FITS image: {path}: {exc}") from exc
+
+    raise ImageIOError(f"FITS file contains no image data: {path}")
 
 def _has_fits_signature(path: Path) -> bool:
     """Return whether the first FITS card begins with ``SIMPLE  =``."""
