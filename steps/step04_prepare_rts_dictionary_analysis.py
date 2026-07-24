@@ -1,7 +1,7 @@
 """Step 04: prepare an RTS dictionary analysis plan.
 
-Version 4.22.0 adds deterministic atomic metadata JSON output paired with
-dictionary CSV builds while preserving all existing public APIs.
+Version 4.23.0 adds validated metadata JSON loading into immutable
+structured objects while preserving all existing public APIs.
 """
 
 from __future__ import annotations
@@ -14,7 +14,7 @@ import json
 import os
 import tempfile
 
-__version__ = "4.22.0"
+__version__ = "4.23.0"
 
 from dataclasses import dataclass
 
@@ -33,6 +33,7 @@ __all__ = [
     "RTSCandidateResult",
     "RTSDictionaryBuildResult",
     "RTSDictionaryArtifactResult",
+    "RTSDictionaryMetadata",
     "RTSProgressState",
     "RTSCancellationInfo",
     "RTSDictionaryBuildParameters",
@@ -60,6 +61,7 @@ __all__ = [
     "rts_candidate_to_row",
     "write_rts_dictionary_csv",
     "write_rts_dictionary_metadata_json",
+    "load_rts_dictionary_metadata_json",
     "build_rts_dictionary_artifacts",
     "build_rts_dictionary_csv",
     "build_rts_dictionary_csv_result",
@@ -524,6 +526,52 @@ class RTSDictionaryBuildResult:
             "parameters": self.parameters.summary(),
         }
 
+
+
+
+@dataclass(slots=True, frozen=True)
+class RTSDictionaryMetadata:
+    """Immutable validated representation of one metadata sidecar."""
+
+    metadata_path: Path
+    schema: str
+    schema_version: int
+    step04_version: str
+    csv_path: Path
+    dataset: str
+    analyzed_pixel_count: int
+    candidate_count: int
+    n_frames: int
+    image_shape: tuple[int, int]
+    minimum_frames: int
+    pixel_dtype: str
+    exposure_s: float
+    temperature_min_C: float
+    temperature_max_C: float
+    filepaths: tuple[Path, ...]
+    parameters: RTSDictionaryBuildParameters
+
+    def summary(self) -> dict[str, object]:
+        """Return a deterministic JSON-serializable metadata summary."""
+        return {
+            "metadata_path": str(self.metadata_path),
+            "schema": self.schema,
+            "schema_version": self.schema_version,
+            "step04_version": self.step04_version,
+            "csv_path": str(self.csv_path),
+            "dataset": self.dataset,
+            "analyzed_pixel_count": self.analyzed_pixel_count,
+            "candidate_count": self.candidate_count,
+            "n_frames": self.n_frames,
+            "image_shape": self.image_shape,
+            "minimum_frames": self.minimum_frames,
+            "pixel_dtype": self.pixel_dtype,
+            "exposure_s": self.exposure_s,
+            "temperature_min_C": self.temperature_min_C,
+            "temperature_max_C": self.temperature_max_C,
+            "filepaths": tuple(str(path) for path in self.filepaths),
+            "parameters": self.parameters.summary(),
+        }
 
 
 @dataclass(slots=True, frozen=True)
@@ -1030,6 +1078,263 @@ def _dictionary_metadata_document(
         },
         "parameters": result.parameters.summary(),
     }
+
+
+
+def _require_metadata_mapping(value, name: str) -> dict:
+    if not isinstance(value, dict):
+        raise Step04Error(f"{name} must be a JSON object.")
+    return value
+
+
+def _require_metadata_string(value, name: str) -> str:
+    if not isinstance(value, str) or not value:
+        raise Step04Error(f"{name} must be a non-empty string.")
+    return value
+
+
+def _require_metadata_int(value, name: str, *, minimum: int = 0) -> int:
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise Step04Error(f"{name} must be an integer.")
+    if value < minimum:
+        raise Step04Error(f"{name} must be at least {minimum}.")
+    return value
+
+
+def _require_metadata_float(value, name: str) -> float:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise Step04Error(f"{name} must be a real number.")
+    result = float(value)
+    if not np.isfinite(result):
+        raise Step04Error(f"{name} must be finite.")
+    return result
+
+
+def load_rts_dictionary_metadata_json(path) -> RTSDictionaryMetadata:
+    """Load and validate one Step 04 dictionary metadata JSON sidecar."""
+    try:
+        source = Path(path)
+    except TypeError as exc:
+        raise Step04Error("path must be path-like.") from exc
+
+    if not source.is_file():
+        raise Step04Error(f"metadata JSON does not exist: {source}")
+
+    try:
+        with source.open("r", encoding="utf-8") as stream:
+            document = json.load(stream)
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        raise Step04Error(
+            f"Could not read RTS dictionary metadata JSON '{source}': {exc}"
+        ) from exc
+
+    root = _require_metadata_mapping(document, "metadata root")
+    schema = _require_metadata_string(root.get("schema"), "schema")
+    if schema != "rts-framework.step04.dictionary-metadata":
+        raise Step04Error(f"Unsupported metadata schema: {schema}")
+
+    schema_version = _require_metadata_int(
+        root.get("schema_version"), "schema_version", minimum=1
+    )
+    if schema_version != 1:
+        raise Step04Error(
+            f"Unsupported metadata schema_version: {schema_version}"
+        )
+
+    step04_version = _require_metadata_string(
+        root.get("step04_version"), "step04_version"
+    )
+
+    dictionary = _require_metadata_mapping(
+        root.get("dictionary"), "dictionary"
+    )
+    input_info = _require_metadata_mapping(root.get("input"), "input")
+    raw_parameters = _require_metadata_mapping(
+        root.get("parameters"), "parameters"
+    )
+
+    csv_path = Path(
+        _require_metadata_string(dictionary.get("csv_path"),
+                                 "dictionary.csv_path")
+    )
+    dataset = _require_metadata_string(
+        dictionary.get("dataset"), "dictionary.dataset"
+    )
+    analyzed_pixel_count = _require_metadata_int(
+        dictionary.get("analyzed_pixel_count"),
+        "dictionary.analyzed_pixel_count",
+    )
+    candidate_count = _require_metadata_int(
+        dictionary.get("candidate_count"),
+        "dictionary.candidate_count",
+    )
+    if candidate_count > analyzed_pixel_count:
+        raise Step04Error(
+            "dictionary.candidate_count must not exceed "
+            "dictionary.analyzed_pixel_count."
+        )
+
+    input_dataset = _require_metadata_string(
+        input_info.get("dataset"), "input.dataset"
+    )
+    if input_dataset != dataset:
+        raise Step04Error(
+            "input.dataset must match dictionary.dataset."
+        )
+
+    n_frames = _require_metadata_int(
+        input_info.get("n_frames"), "input.n_frames", minimum=1
+    )
+    minimum_frames = _require_metadata_int(
+        input_info.get("minimum_frames"),
+        "input.minimum_frames",
+        minimum=1,
+    )
+    if n_frames < minimum_frames:
+        raise Step04Error(
+            "input.n_frames must not be smaller than input.minimum_frames."
+        )
+
+    image_shape_raw = input_info.get("image_shape")
+    if (
+        not isinstance(image_shape_raw, list)
+        or len(image_shape_raw) != 2
+    ):
+        raise Step04Error(
+            "input.image_shape must be a two-element JSON array."
+        )
+    image_shape = (
+        _require_metadata_int(
+            image_shape_raw[0], "input.image_shape[0]", minimum=1
+        ),
+        _require_metadata_int(
+            image_shape_raw[1], "input.image_shape[1]", minimum=1
+        ),
+    )
+
+    pixel_dtype = _require_metadata_string(
+        input_info.get("pixel_dtype"), "input.pixel_dtype"
+    )
+    exposure_s = _require_metadata_float(
+        input_info.get("exposure_s"), "input.exposure_s"
+    )
+    temperature_min_C = _require_metadata_float(
+        input_info.get("temperature_min_C"), "input.temperature_min_C"
+    )
+    temperature_max_C = _require_metadata_float(
+        input_info.get("temperature_max_C"), "input.temperature_max_C"
+    )
+    if temperature_max_C < temperature_min_C:
+        raise Step04Error(
+            "input.temperature_max_C must not be smaller than "
+            "input.temperature_min_C."
+        )
+
+    filepaths_raw = input_info.get("filepaths")
+    if not isinstance(filepaths_raw, list):
+        raise Step04Error("input.filepaths must be a JSON array.")
+    if len(filepaths_raw) != n_frames:
+        raise Step04Error(
+            "input.filepaths length must match input.n_frames."
+        )
+    filepaths = tuple(
+        Path(_require_metadata_string(value, f"input.filepaths[{index}]"))
+        for index, value in enumerate(filepaths_raw)
+    )
+
+    parameter_names = (
+        "minimum_score",
+        "minimum_state_count",
+        "minimum_separation",
+        "minimum_transition_count",
+        "minimum_lower_run",
+        "minimum_upper_run",
+        "row_start",
+        "row_stop",
+        "column_start",
+        "column_stop",
+    )
+    missing = [name for name in parameter_names if name not in raw_parameters]
+    if missing:
+        raise Step04Error(
+            "parameters is missing required fields: " + ", ".join(missing)
+        )
+
+    parameters = RTSDictionaryBuildParameters(
+        minimum_score=_require_metadata_float(
+            raw_parameters["minimum_score"], "parameters.minimum_score"
+        ),
+        minimum_state_count=_require_metadata_int(
+            raw_parameters["minimum_state_count"],
+            "parameters.minimum_state_count",
+            minimum=1,
+        ),
+        minimum_separation=_require_metadata_float(
+            raw_parameters["minimum_separation"],
+            "parameters.minimum_separation",
+        ),
+        minimum_transition_count=_require_metadata_int(
+            raw_parameters["minimum_transition_count"],
+            "parameters.minimum_transition_count",
+        ),
+        minimum_lower_run=_require_metadata_int(
+            raw_parameters["minimum_lower_run"],
+            "parameters.minimum_lower_run",
+            minimum=1,
+        ),
+        minimum_upper_run=_require_metadata_int(
+            raw_parameters["minimum_upper_run"],
+            "parameters.minimum_upper_run",
+            minimum=1,
+        ),
+        row_start=_require_metadata_int(
+            raw_parameters["row_start"], "parameters.row_start"
+        ),
+        row_stop=_require_metadata_int(
+            raw_parameters["row_stop"], "parameters.row_stop"
+        ),
+        column_start=_require_metadata_int(
+            raw_parameters["column_start"], "parameters.column_start"
+        ),
+        column_stop=_require_metadata_int(
+            raw_parameters["column_stop"], "parameters.column_stop"
+        ),
+    )
+
+    if parameters.row_stop > image_shape[0]:
+        raise Step04Error(
+            "parameters.row_stop exceeds input.image_shape."
+        )
+    if parameters.column_stop > image_shape[1]:
+        raise Step04Error(
+            "parameters.column_stop exceeds input.image_shape."
+        )
+    if parameters.pixel_count != analyzed_pixel_count:
+        raise Step04Error(
+            "parameters.pixel_count must match "
+            "dictionary.analyzed_pixel_count."
+        )
+
+    return RTSDictionaryMetadata(
+        metadata_path=source,
+        schema=schema,
+        schema_version=schema_version,
+        step04_version=step04_version,
+        csv_path=csv_path,
+        dataset=dataset,
+        analyzed_pixel_count=analyzed_pixel_count,
+        candidate_count=candidate_count,
+        n_frames=n_frames,
+        image_shape=image_shape,
+        minimum_frames=minimum_frames,
+        pixel_dtype=pixel_dtype,
+        exposure_s=exposure_s,
+        temperature_min_C=temperature_min_C,
+        temperature_max_C=temperature_max_C,
+        filepaths=filepaths,
+        parameters=parameters,
+    )
+
 
 
 def write_rts_dictionary_metadata_json(
