@@ -1,13 +1,13 @@
 """Step 03: prepare one dataset for bias and RTS analysis.
 
-Version 3.2.0 adds one-pass arithmetic-mean master-bias computation on top
-of lazy bias-frame iteration. The result is an immutable metadata object
-containing a read-only, C-contiguous float64 master image.
+Version 3.3.0 adds an exact full-stack median master-bias reference
+implementation. It reads each frame once, retains the complete float64
+image stack, and returns an immutable read-only median master image.
 """
 
 from __future__ import annotations
 
-__version__ = "3.2.0"
+__version__ = "3.3.0"
 
 from dataclasses import dataclass
 import math
@@ -29,8 +29,10 @@ from steps.step02_prepare_frame_groups import (
 __all__ = [
     "BiasAnalysisPlan",
     "MeanMasterBiasResult",
+    "MedianMasterBiasResult",
     "Step03Error",
     "compute_mean_master_bias",
+    "compute_median_master_bias",
     "iter_bias_frames",
     "prepare_bias_analysis",
 ]
@@ -52,6 +54,21 @@ class MeanMasterBiasResult:
     minimum: float
     maximum: float
     mean: float
+
+
+
+@dataclass(slots=True, frozen=True)
+class MedianMasterBiasResult:
+    """Immutable exact median master-bias result."""
+
+    plan: "BiasAnalysisPlan"
+    dataset: str
+    n_frames: int
+    image_shape: tuple[int, int]
+    master_bias: np.ndarray
+    minimum: float
+    maximum: float
+    median: float
 
 
 
@@ -154,6 +171,96 @@ def prepare_bias_analysis(
         exposure_s=group.exposure_s,
         temperature_min_C=group.temperature_min_C,
         temperature_max_C=group.temperature_max_C,
+    )
+
+
+def compute_median_master_bias(
+    plan: BiasAnalysisPlan,
+) -> MedianMasterBiasResult:
+    """Compute an exact median master bias using a full in-memory stack.
+
+    Images are obtained exclusively from :func:`iter_bias_frames` and are read
+    exactly once. Unlike :func:`compute_mean_master_bias`, this reference
+    implementation retains every float64 image simultaneously so that
+    ``numpy.median(..., axis=0)`` can compute the exact per-pixel median.
+
+    Approximate stack memory usage is::
+
+        n_frames * image_height * image_width * 8 bytes
+
+    This implementation is intended as a correctness reference. Large-format
+    detectors or large frame counts may require a later tiled implementation.
+
+    Parameters
+    ----------
+    plan
+        Bias-analysis plan returned by :func:`prepare_bias_analysis`.
+
+    Returns
+    -------
+    MedianMasterBiasResult
+        Immutable result containing a read-only exact median master image.
+
+    Raises
+    ------
+    Step03Error
+        If ``plan`` is invalid, no frames are yielded, the iterator yields an
+        unexpected frame count, or an image violates the planned shape.
+    """
+    if not isinstance(plan, BiasAnalysisPlan):
+        raise Step03Error(
+            "plan must be a BiasAnalysisPlan returned by "
+            "prepare_bias_analysis()."
+        )
+
+    stack = np.empty(
+        (plan.n_frames, *plan.image_shape),
+        dtype=np.float64,
+        order="C",
+    )
+    count = 0
+
+    for image in iter_bias_frames(plan):
+        if count >= plan.n_frames:
+            raise Step03Error(
+                f"Bias dataset {plan.dataset!r} yielded more than "
+                f"{plan.n_frames} frame(s)."
+            )
+        if image.shape != plan.image_shape:
+            raise Step03Error(
+                f"Bias frame {count} has shape {image.shape!r}; "
+                f"expected {plan.image_shape!r}."
+            )
+        stack[count] = image
+        count += 1
+
+    if count == 0:
+        raise Step03Error(
+            f"Bias dataset {plan.dataset!r} yielded no frames."
+        )
+    if count != plan.n_frames:
+        raise Step03Error(
+            f"Bias dataset {plan.dataset!r} yielded {count} frame(s); "
+            f"the analysis plan requires {plan.n_frames}."
+        )
+
+    master_bias = np.array(
+        np.median(stack, axis=0),
+        dtype=np.float64,
+        order="C",
+        copy=True,
+    )
+    master_bias.setflags(write=False)
+
+    return MedianMasterBiasResult(
+        plan=plan,
+        dataset=plan.dataset,
+        n_frames=count,
+        image_shape=plan.image_shape,
+        master_bias=master_bias,
+        minimum=float(np.min(master_bias)),
+        maximum=float(np.max(master_bias)),
+        median=float(np.median(master_bias)),
     )
 
 
