@@ -1,7 +1,7 @@
 """Step 04: prepare an RTS dictionary analysis plan.
 
-Version 4.16.0 adds deterministic optional progress callbacks for the
-high-level image-to-CSV build APIs without changing RTS analysis logic.
+Version 4.17.0 adds a deterministic interval progress callback wrapper
+without changing the existing per-pixel progress notification contract.
 """
 
 from __future__ import annotations
@@ -12,7 +12,7 @@ import csv
 import os
 import tempfile
 
-__version__ = "4.16.0"
+__version__ = "4.17.0"
 
 from dataclasses import dataclass
 
@@ -45,6 +45,7 @@ __all__ = [
     "iter_image_coordinates",
     "iter_image_rts_analyses",
     "iter_rts_candidates",
+    "make_interval_progress_callback",
     "iter_rts_pixel_analyses",
     "load_pixel_timeseries",
     "prepare_rts_dictionary_analysis",
@@ -505,6 +506,40 @@ RTS_DICTIONARY_COLUMNS = (
     "is_candidate",
 )
 
+
+
+
+
+def make_interval_progress_callback(callback, *, every: int):
+    """Return a callback that forwards deterministic interval progress events.
+
+    The wrapped callback receives the initial event, every ``every`` completed
+    pixels, and the final event. Duplicate events are suppressed. The helper
+    does not alter or catch exceptions raised by the wrapped callback.
+    """
+    if not callable(callback):
+        raise Step04Error("callback must be callable.")
+    if isinstance(every, bool) or not isinstance(every, int):
+        raise Step04Error("every must be an integer.")
+    if every <= 0:
+        raise Step04Error("every must be greater than zero.")
+
+    last_forwarded: tuple[int, int] | None = None
+
+    def interval_callback(completed: int, total: int) -> None:
+        nonlocal last_forwarded
+
+        event = (completed, total)
+        should_forward = (
+            completed == 0
+            or completed == total
+            or completed % every == 0
+        )
+        if should_forward and event != last_forwarded:
+            callback(completed, total)
+            last_forwarded = event
+
+    return interval_callback
 
 
 
