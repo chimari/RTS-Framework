@@ -7,9 +7,10 @@ No image pixels are read in this step.
 
 from __future__ import annotations
 
-__version__ = "2.2.0"
+__version__ = "2.3.0"
 
 import argparse
+import csv
 from dataclasses import dataclass
 from pathlib import Path
 import sys
@@ -502,6 +503,76 @@ def _dtype_equivalent(
         actual.kind == expected.kind
         and actual.itemsize == expected.itemsize
     )
+
+
+STATISTICS_CSV_COLUMNS = (
+    "dataset",
+    "frame_index",
+    "filepath",
+    "temperature_C",
+    "exposure_s",
+    "finite_pixels",
+    "total_pixels",
+    "minimum",
+    "maximum",
+    "mean",
+    "median",
+    "stddev",
+)
+
+
+def write_statistics_csv(
+    statistics: DatasetStatistics,
+    output_path: str | Path,
+) -> Path:
+    """Write per-frame dataset statistics as deterministic CSV.
+
+    The output uses a fixed column order, UTF-8 encoding, LF line endings,
+    and frame-index ordering. Parent directories are created automatically.
+    """
+    path = Path(output_path)
+    ordered_frames = sorted(
+        statistics.frames,
+        key=lambda frame: (frame.frame_index, str(frame.filepath)),
+    )
+
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("w", encoding="utf-8", newline="") as stream:
+            writer = csv.DictWriter(
+                stream,
+                fieldnames=STATISTICS_CSV_COLUMNS,
+                lineterminator="\n",
+            )
+            writer.writeheader()
+            for frame in ordered_frames:
+                writer.writerow(
+                    {
+                        "dataset": frame.dataset,
+                        "frame_index": frame.frame_index,
+                        "filepath": str(frame.filepath.resolve()),
+                        "temperature_C": _format_float(frame.temperature_C),
+                        "exposure_s": _format_float(frame.exposure_s),
+                        "finite_pixels": frame.finite_pixels,
+                        "total_pixels": frame.total_pixels,
+                        "minimum": _format_float(frame.minimum),
+                        "maximum": _format_float(frame.maximum),
+                        "mean": _format_float(frame.mean),
+                        "median": _format_float(frame.median),
+                        "stddev": _format_float(frame.stddev),
+                    }
+                )
+    except (OSError, csv.Error, TypeError, ValueError) as exc:
+        raise Step02Error(
+            f"Unable to write Step 02 statistics CSV: {path}: {exc}"
+        ) from exc
+
+    return path
+
+
+def _format_float(value: float) -> str:
+    """Return a stable round-trippable decimal representation."""
+    return format(float(value), ".17g")
 
 def build_argument_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
