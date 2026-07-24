@@ -1,7 +1,7 @@
 """Step 04: prepare an RTS dictionary analysis plan.
 
-Version 4.13.0 adds deterministic atomic CSV writing for final RTS
-candidate rows while preserving input order and duplicates.
+Version 4.14.0 adds a high-level image-to-CSV pipeline by composing the
+existing image analysis, candidate filtering, and atomic CSV writer APIs.
 """
 
 from __future__ import annotations
@@ -12,7 +12,7 @@ import csv
 import os
 import tempfile
 
-__version__ = "4.13.0"
+__version__ = "4.14.0"
 
 from dataclasses import dataclass
 
@@ -49,6 +49,7 @@ __all__ = [
     "prepare_rts_dictionary_analysis",
     "rts_candidate_to_row",
     "write_rts_dictionary_csv",
+    "build_rts_dictionary_csv",
 ]
 
 
@@ -464,6 +465,71 @@ RTS_DICTIONARY_COLUMNS = (
     "is_candidate",
 )
 
+
+
+def build_rts_dictionary_csv(
+    plan: RTSDictionaryPlan,
+    output_path,
+    *,
+    row_start: int | None = None,
+    row_stop: int | None = None,
+    column_start: int | None = None,
+    column_stop: int | None = None,
+    minimum_score: float = 0.0,
+    minimum_state_count: int = 1,
+    minimum_separation: float = 0.0,
+    minimum_transition_count: int = 0,
+    minimum_lower_run: int = 1,
+    minimum_upper_run: int = 1,
+) -> Path:
+    """Analyze an image region and atomically write its final RTS candidates.
+
+    This function introduces no new analysis logic. It composes
+    :func:`iter_image_rts_analyses`, :func:`iter_rts_candidates`, and
+    :func:`write_rts_dictionary_csv`.
+
+    Parameters
+    ----------
+    plan
+        Prepared RTS dictionary analysis plan.
+    output_path
+        Destination CSV path.
+    row_start, row_stop, column_start, column_stop
+        Optional half-open image region. ``None`` uses the corresponding image
+        edge.
+    minimum_score, minimum_state_count, minimum_separation
+        Two-state candidate thresholds.
+    minimum_transition_count, minimum_lower_run, minimum_upper_run
+        Temporal candidate thresholds.
+
+    Returns
+    -------
+    pathlib.Path
+        The destination path returned by :func:`write_rts_dictionary_csv`.
+
+    Raises
+    ------
+    Step04Error
+        Propagated from the composed Step 04 APIs.
+    """
+    normalized_row_start = 0 if row_start is None else row_start
+    normalized_column_start = 0 if column_start is None else column_start
+
+    analyses = iter_image_rts_analyses(
+        plan,
+        row_start=normalized_row_start,
+        row_stop=row_stop,
+        column_start=normalized_column_start,
+        column_stop=column_stop,
+        minimum_score=minimum_score,
+        minimum_state_count=minimum_state_count,
+        minimum_separation=minimum_separation,
+        minimum_transition_count=minimum_transition_count,
+        minimum_lower_run=minimum_lower_run,
+        minimum_upper_run=minimum_upper_run,
+    )
+    candidates = iter_rts_candidates(analyses)
+    return write_rts_dictionary_csv(output_path, candidates)
 
 def write_rts_dictionary_csv(path, candidates) -> Path:
     """Atomically write final RTS candidates to a deterministic UTF-8 CSV.
