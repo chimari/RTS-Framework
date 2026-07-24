@@ -1,13 +1,13 @@
 """Step 05: prepare deterministic RTS correction plans.
 
-Version 5.0.0 introduces the safe boundary between the validated Step 04
-dictionary artifacts and later image-correction algorithms.  This release
-does not modify pixel values.
+Version 5.1.0 adds deterministic classification of current candidate-pixel
+values without modifying the input image.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
+from enum import Enum
 from pathlib import Path
 
 import numpy as np
@@ -20,18 +20,32 @@ from steps.step04_prepare_rts_dictionary_analysis import (
     validate_rts_dictionary_artifacts,
 )
 
-__version__ = "5.0.0"
+__version__ = "5.1.0"
 
 __all__ = [
+    "RTSCandidateClassification",
+    "RTSCandidateState",
     "RTSCorrectionCandidate",
+    "RTSCorrectionClassificationResult",
     "RTSCorrectionPlan",
     "Step05Error",
+    "classify_rts_correction_candidates",
     "prepare_rts_correction",
 ]
 
 
 class Step05Error(Exception):
     """Raised when Step 05 cannot prepare an RTS correction plan."""
+
+
+
+class RTSCandidateState(str, Enum):
+    """Classification of one current RTS candidate-pixel value."""
+
+    LOWER = "LOWER"
+    UPPER = "UPPER"
+    MIDPOINT = "MIDPOINT"
+    OUTSIDE = "OUTSIDE"
 
 
 @dataclass(slots=True, frozen=True)
@@ -108,6 +122,100 @@ class RTSCorrectionPlan:
             "coordinates": self.coordinates,
             "candidates": tuple(
                 candidate.summary() for candidate in self.candidates
+            ),
+        }
+
+
+
+@dataclass(slots=True, frozen=True)
+class RTSCandidateClassification:
+    """Immutable state classification for one candidate pixel."""
+
+    candidate: RTSCorrectionCandidate
+    pixel_value: float
+    state: RTSCandidateState
+    tolerance: float
+    distance_to_lower: float
+    distance_to_upper: float
+
+    @property
+    def coordinate(self) -> tuple[int, int]:
+        """Return the classified candidate coordinate."""
+        return self.candidate.coordinate
+
+    @property
+    def nearest_state(self) -> RTSCandidateState:
+        """Return LOWER or UPPER according to the nearest state center."""
+        if self.distance_to_lower <= self.distance_to_upper:
+            return RTSCandidateState.LOWER
+        return RTSCandidateState.UPPER
+
+    def summary(self) -> dict[str, object]:
+        """Return one deterministic JSON-serializable classification."""
+        return {
+            "row": self.candidate.row,
+            "column": self.candidate.column,
+            "coordinate": self.coordinate,
+            "pixel_value": self.pixel_value,
+            "state": self.state.value,
+            "nearest_state": self.nearest_state.value,
+            "tolerance": self.tolerance,
+            "distance_to_lower": self.distance_to_lower,
+            "distance_to_upper": self.distance_to_upper,
+            "lower_state_center": self.candidate.lower_state_center,
+            "upper_state_center": self.candidate.upper_state_center,
+            "midpoint": self.candidate.midpoint,
+        }
+
+
+@dataclass(slots=True, frozen=True)
+class RTSCorrectionClassificationResult:
+    """Immutable classifications for every candidate in one correction plan."""
+
+    plan: RTSCorrectionPlan
+    state_tolerance_fraction: float
+    classifications: tuple[RTSCandidateClassification, ...]
+
+    @property
+    def candidate_count(self) -> int:
+        """Return the number of classified candidates."""
+        return len(self.classifications)
+
+    def count(self, state: RTSCandidateState) -> int:
+        """Count classifications with one state."""
+        if not isinstance(state, RTSCandidateState):
+            raise Step05Error("state must be an RTSCandidateState.")
+        return sum(item.state is state for item in self.classifications)
+
+    @property
+    def lower_count(self) -> int:
+        return self.count(RTSCandidateState.LOWER)
+
+    @property
+    def upper_count(self) -> int:
+        return self.count(RTSCandidateState.UPPER)
+
+    @property
+    def midpoint_count(self) -> int:
+        return self.count(RTSCandidateState.MIDPOINT)
+
+    @property
+    def outside_count(self) -> int:
+        return self.count(RTSCandidateState.OUTSIDE)
+
+    def summary(self) -> dict[str, object]:
+        """Return one deterministic JSON-serializable result summary."""
+        return {
+            "step05_version": __version__,
+            "input_path": str(self.plan.input_path),
+            "state_tolerance_fraction": self.state_tolerance_fraction,
+            "candidate_count": self.candidate_count,
+            "lower_count": self.lower_count,
+            "upper_count": self.upper_count,
+            "midpoint_count": self.midpoint_count,
+            "outside_count": self.outside_count,
+            "classifications": tuple(
+                item.summary() for item in self.classifications
             ),
         }
 
@@ -273,4 +381,127 @@ def prepare_rts_correction(
         dataset=validation.artifacts.dataset,
         candidates=candidates,
         artifact_validation=validation,
+    )
+
+
+def _validated_state_tolerance_fraction(value) -> float:
+    """Return a finite tolerance fraction in the supported interval."""
+    if isinstance(value, bool):
+        raise Step05Error(
+            "state_tolerance_fraction must be a real number."
+        )
+    try:
+        fraction = float(value)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise Step05Error(
+            "state_tolerance_fraction must be a real number."
+        ) from exc
+
+    if not np.isfinite(fraction):
+        raise Step05Error(
+            "state_tolerance_fraction must be finite."
+        )
+    if not 0.0 <= fraction < 0.5:
+        raise Step05Error(
+            "state_tolerance_fraction must satisfy 0 <= value < 0.5."
+        )
+    return fraction
+
+
+def _classify_candidate_value(
+    candidate: RTSCorrectionCandidate,
+    pixel_value: float,
+    tolerance_fraction: float,
+) -> RTSCandidateClassification:
+    """Classify one finite current pixel value deterministically."""
+    if not np.isfinite(pixel_value):
+        raise Step05Error(
+            f"candidate pixel value is not finite at {candidate.coordinate}."
+        )
+
+    tolerance = candidate.state_separation * tolerance_fraction
+    distance_to_lower = abs(pixel_value - candidate.lower_state_center)
+    distance_to_upper = abs(pixel_value - candidate.upper_state_center)
+
+    if distance_to_lower <= tolerance:
+        state = RTSCandidateState.LOWER
+    elif distance_to_upper <= tolerance:
+        state = RTSCandidateState.UPPER
+    elif (
+        candidate.lower_state_center
+        < pixel_value
+        < candidate.upper_state_center
+    ):
+        state = RTSCandidateState.MIDPOINT
+    else:
+        state = RTSCandidateState.OUTSIDE
+
+    return RTSCandidateClassification(
+        candidate=candidate,
+        pixel_value=float(pixel_value),
+        state=state,
+        tolerance=float(tolerance),
+        distance_to_lower=float(distance_to_lower),
+        distance_to_upper=float(distance_to_upper),
+    )
+
+
+def classify_rts_correction_candidates(
+    plan: RTSCorrectionPlan,
+    *,
+    state_tolerance_fraction=0.25,
+) -> RTSCorrectionClassificationResult:
+    """Read and classify every planned RTS candidate without modifying FITS.
+
+    A value within ``state_separation * state_tolerance_fraction`` of a state
+    center is classified as LOWER or UPPER.  A value strictly between the two
+    state centers but outside both tolerance bands is MIDPOINT.  Any other
+    finite value is OUTSIDE.
+    """
+    if not isinstance(plan, RTSCorrectionPlan):
+        raise Step05Error("plan must be an RTSCorrectionPlan.")
+
+    fraction = _validated_state_tolerance_fraction(
+        state_tolerance_fraction
+    )
+
+    try:
+        with fits.open(
+            plan.input_path,
+            mode="readonly",
+            memmap=False,
+            do_not_scale_image_data=False,
+            uint=True,
+        ) as hdul:
+            data = hdul[0].data
+            if data is None or data.ndim != 2:
+                raise Step05Error(
+                    "input FITS primary image is no longer two-dimensional."
+                )
+            current_shape = tuple(int(value) for value in data.shape)
+            if current_shape != plan.image_shape:
+                raise Step05Error(
+                    "input FITS image_shape changed after plan preparation: "
+                    f"expected {plan.image_shape}, got {current_shape}."
+                )
+
+            classifications = tuple(
+                _classify_candidate_value(
+                    candidate,
+                    float(data[candidate.row, candidate.column]),
+                    fraction,
+                )
+                for candidate in plan.candidates
+            )
+    except Step05Error:
+        raise
+    except (OSError, ValueError, TypeError, IndexError) as exc:
+        raise Step05Error(
+            f"Could not classify RTS candidates in '{plan.input_path}': {exc}"
+        ) from exc
+
+    return RTSCorrectionClassificationResult(
+        plan=plan,
+        state_tolerance_fraction=fraction,
+        classifications=classifications,
     )
