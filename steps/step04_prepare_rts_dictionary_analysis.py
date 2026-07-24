@@ -1,6 +1,6 @@
 """Step 04: prepare an RTS dictionary analysis plan.
 
-Version 4.23.0 adds validated metadata JSON loading into immutable
+Version 4.24.0 adds validated RTS dictionary CSV loading into immutable
 structured objects while preserving all existing public APIs.
 """
 
@@ -14,7 +14,7 @@ import json
 import os
 import tempfile
 
-__version__ = "4.23.0"
+__version__ = "4.24.0"
 
 from dataclasses import dataclass
 
@@ -34,6 +34,8 @@ __all__ = [
     "RTSDictionaryBuildResult",
     "RTSDictionaryArtifactResult",
     "RTSDictionaryMetadata",
+    "RTSDictionaryRow",
+    "RTSDictionaryCSV",
     "RTSProgressState",
     "RTSCancellationInfo",
     "RTSDictionaryBuildParameters",
@@ -62,6 +64,7 @@ __all__ = [
     "write_rts_dictionary_csv",
     "write_rts_dictionary_metadata_json",
     "load_rts_dictionary_metadata_json",
+    "load_rts_dictionary_csv",
     "build_rts_dictionary_artifacts",
     "build_rts_dictionary_csv",
     "build_rts_dictionary_csv_result",
@@ -527,6 +530,83 @@ class RTSDictionaryBuildResult:
         }
 
 
+
+
+
+@dataclass(slots=True, frozen=True)
+class RTSDictionaryRow:
+    """Immutable validated representation of one dictionary CSV row."""
+
+    dataset: str
+    row: int
+    column: int
+    n_frames: int
+    minimum: float
+    maximum: float
+    mean: float
+    median: float
+    standard_deviation: float
+    median_absolute_deviation: float
+    peak_to_peak: float
+    lower_state_count: int
+    upper_state_count: int
+    lower_state_center: float
+    upper_state_center: float
+    state_separation: float
+    single_state_residual: float
+    two_state_residual: float
+    two_state_score: float
+    minimum_score: float
+    minimum_state_count: int
+    minimum_separation: float
+    transition_count: int
+    lower_to_upper_count: int
+    upper_to_lower_count: int
+    longest_lower_run: int
+    longest_upper_run: int
+    minimum_transition_count: int
+    minimum_lower_run: int
+    minimum_upper_run: int
+    is_candidate: bool
+
+    @property
+    def coordinate(self) -> tuple[int, int]:
+        """Return ``(row, column)``."""
+        return (self.row, self.column)
+
+    def summary(self) -> dict[str, object]:
+        """Return values in canonical dictionary-column order."""
+        return {
+            name: getattr(self, name)
+            for name in RTS_DICTIONARY_COLUMNS
+        }
+
+
+@dataclass(slots=True, frozen=True)
+class RTSDictionaryCSV:
+    """Immutable validated representation of one dictionary CSV file."""
+
+    path: Path
+    rows: tuple[RTSDictionaryRow, ...]
+
+    @property
+    def candidate_count(self) -> int:
+        """Return the number of validated candidate rows."""
+        return len(self.rows)
+
+    @property
+    def datasets(self) -> tuple[str, ...]:
+        """Return unique dataset names in first-occurrence order."""
+        return tuple(dict.fromkeys(row.dataset for row in self.rows))
+
+    def summary(self) -> dict[str, object]:
+        """Return a deterministic JSON-serializable file summary."""
+        return {
+            "path": str(self.path),
+            "candidate_count": self.candidate_count,
+            "datasets": self.datasets,
+            "coordinates": tuple(row.coordinate for row in self.rows),
+        }
 
 
 @dataclass(slots=True, frozen=True)
@@ -1078,6 +1158,268 @@ def _dictionary_metadata_document(
         },
         "parameters": result.parameters.summary(),
     }
+
+
+
+
+def _parse_csv_int(value: str, name: str, row_number: int,
+                   *, minimum: int = 0) -> int:
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError) as exc:
+        raise Step04Error(
+            f"CSV row {row_number} field {name} must be an integer."
+        ) from exc
+    if str(parsed) != value.strip():
+        raise Step04Error(
+            f"CSV row {row_number} field {name} must use canonical "
+            "integer formatting."
+        )
+    if parsed < minimum:
+        raise Step04Error(
+            f"CSV row {row_number} field {name} must be at least {minimum}."
+        )
+    return parsed
+
+
+def _parse_csv_float(value: str, name: str, row_number: int,
+                     *, minimum: float | None = None) -> float:
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError) as exc:
+        raise Step04Error(
+            f"CSV row {row_number} field {name} must be a real number."
+        ) from exc
+    if not np.isfinite(parsed):
+        raise Step04Error(
+            f"CSV row {row_number} field {name} must be finite."
+        )
+    if minimum is not None and parsed < minimum:
+        raise Step04Error(
+            f"CSV row {row_number} field {name} must be at least {minimum}."
+        )
+    return parsed
+
+
+def _parse_csv_candidate_bool(value: str, row_number: int) -> bool:
+    if value == "True":
+        return True
+    if value == "False":
+        return False
+    raise Step04Error(
+        f"CSV row {row_number} field is_candidate must be True or False."
+    )
+
+
+def _dictionary_row_from_csv(raw: dict[str, str],
+                             row_number: int) -> RTSDictionaryRow:
+    dataset = raw["dataset"]
+    if not dataset:
+        raise Step04Error(
+            f"CSV row {row_number} field dataset must be non-empty."
+        )
+
+    row = RTSDictionaryRow(
+        dataset=dataset,
+        row=_parse_csv_int(raw["row"], "row", row_number),
+        column=_parse_csv_int(raw["column"], "column", row_number),
+        n_frames=_parse_csv_int(
+            raw["n_frames"], "n_frames", row_number, minimum=1
+        ),
+        minimum=_parse_csv_float(raw["minimum"], "minimum", row_number),
+        maximum=_parse_csv_float(raw["maximum"], "maximum", row_number),
+        mean=_parse_csv_float(raw["mean"], "mean", row_number),
+        median=_parse_csv_float(raw["median"], "median", row_number),
+        standard_deviation=_parse_csv_float(
+            raw["standard_deviation"], "standard_deviation", row_number,
+            minimum=0.0,
+        ),
+        median_absolute_deviation=_parse_csv_float(
+            raw["median_absolute_deviation"],
+            "median_absolute_deviation",
+            row_number,
+            minimum=0.0,
+        ),
+        peak_to_peak=_parse_csv_float(
+            raw["peak_to_peak"], "peak_to_peak", row_number, minimum=0.0
+        ),
+        lower_state_count=_parse_csv_int(
+            raw["lower_state_count"], "lower_state_count", row_number,
+            minimum=1,
+        ),
+        upper_state_count=_parse_csv_int(
+            raw["upper_state_count"], "upper_state_count", row_number,
+            minimum=1,
+        ),
+        lower_state_center=_parse_csv_float(
+            raw["lower_state_center"], "lower_state_center", row_number
+        ),
+        upper_state_center=_parse_csv_float(
+            raw["upper_state_center"], "upper_state_center", row_number
+        ),
+        state_separation=_parse_csv_float(
+            raw["state_separation"], "state_separation", row_number,
+            minimum=0.0,
+        ),
+        single_state_residual=_parse_csv_float(
+            raw["single_state_residual"], "single_state_residual",
+            row_number, minimum=0.0,
+        ),
+        two_state_residual=_parse_csv_float(
+            raw["two_state_residual"], "two_state_residual",
+            row_number, minimum=0.0,
+        ),
+        two_state_score=_parse_csv_float(
+            raw["two_state_score"], "two_state_score", row_number
+        ),
+        minimum_score=_parse_csv_float(
+            raw["minimum_score"], "minimum_score", row_number
+        ),
+        minimum_state_count=_parse_csv_int(
+            raw["minimum_state_count"], "minimum_state_count",
+            row_number, minimum=1,
+        ),
+        minimum_separation=_parse_csv_float(
+            raw["minimum_separation"], "minimum_separation",
+            row_number, minimum=0.0,
+        ),
+        transition_count=_parse_csv_int(
+            raw["transition_count"], "transition_count", row_number
+        ),
+        lower_to_upper_count=_parse_csv_int(
+            raw["lower_to_upper_count"], "lower_to_upper_count", row_number
+        ),
+        upper_to_lower_count=_parse_csv_int(
+            raw["upper_to_lower_count"], "upper_to_lower_count", row_number
+        ),
+        longest_lower_run=_parse_csv_int(
+            raw["longest_lower_run"], "longest_lower_run",
+            row_number, minimum=1,
+        ),
+        longest_upper_run=_parse_csv_int(
+            raw["longest_upper_run"], "longest_upper_run",
+            row_number, minimum=1,
+        ),
+        minimum_transition_count=_parse_csv_int(
+            raw["minimum_transition_count"], "minimum_transition_count",
+            row_number,
+        ),
+        minimum_lower_run=_parse_csv_int(
+            raw["minimum_lower_run"], "minimum_lower_run",
+            row_number, minimum=1,
+        ),
+        minimum_upper_run=_parse_csv_int(
+            raw["minimum_upper_run"], "minimum_upper_run",
+            row_number, minimum=1,
+        ),
+        is_candidate=_parse_csv_candidate_bool(
+            raw["is_candidate"], row_number
+        ),
+    )
+
+    if not row.is_candidate:
+        raise Step04Error(
+            f"CSV row {row_number} is not a final RTS candidate."
+        )
+    if row.maximum < row.minimum:
+        raise Step04Error(
+            f"CSV row {row_number} maximum must not be smaller than minimum."
+        )
+    if row.peak_to_peak != row.maximum - row.minimum:
+        raise Step04Error(
+            f"CSV row {row_number} peak_to_peak is inconsistent."
+        )
+    if row.lower_state_count + row.upper_state_count != row.n_frames:
+        raise Step04Error(
+            f"CSV row {row_number} state counts must sum to n_frames."
+        )
+    if row.upper_state_center < row.lower_state_center:
+        raise Step04Error(
+            f"CSV row {row_number} upper_state_center must not be smaller "
+            "than lower_state_center."
+        )
+    if row.state_separation != (
+        row.upper_state_center - row.lower_state_center
+    ):
+        raise Step04Error(
+            f"CSV row {row_number} state_separation is inconsistent."
+        )
+    if row.lower_to_upper_count + row.upper_to_lower_count != (
+        row.transition_count
+    ):
+        raise Step04Error(
+            f"CSV row {row_number} transition counts are inconsistent."
+        )
+    if row.two_state_score < row.minimum_score:
+        raise Step04Error(
+            f"CSV row {row_number} does not satisfy minimum_score."
+        )
+    if min(row.lower_state_count, row.upper_state_count) < (
+        row.minimum_state_count
+    ):
+        raise Step04Error(
+            f"CSV row {row_number} does not satisfy minimum_state_count."
+        )
+    if row.state_separation < row.minimum_separation:
+        raise Step04Error(
+            f"CSV row {row_number} does not satisfy minimum_separation."
+        )
+    if row.transition_count < row.minimum_transition_count:
+        raise Step04Error(
+            f"CSV row {row_number} does not satisfy "
+            "minimum_transition_count."
+        )
+    if row.longest_lower_run < row.minimum_lower_run:
+        raise Step04Error(
+            f"CSV row {row_number} does not satisfy minimum_lower_run."
+        )
+    if row.longest_upper_run < row.minimum_upper_run:
+        raise Step04Error(
+            f"CSV row {row_number} does not satisfy minimum_upper_run."
+        )
+    return row
+
+
+def load_rts_dictionary_csv(path) -> RTSDictionaryCSV:
+    """Load and validate one canonical Step 04 RTS dictionary CSV."""
+    try:
+        source = Path(path)
+    except TypeError as exc:
+        raise Step04Error("path must be path-like.") from exc
+    if not source.is_file():
+        raise Step04Error(f"dictionary CSV does not exist: {source}")
+
+    try:
+        with source.open("r", encoding="utf-8", newline="") as stream:
+            reader = csv.DictReader(stream)
+            if reader.fieldnames is None:
+                raise Step04Error("dictionary CSV is missing its header.")
+            if tuple(reader.fieldnames) != RTS_DICTIONARY_COLUMNS:
+                raise Step04Error(
+                    "dictionary CSV header does not match "
+                    "RTS_DICTIONARY_COLUMNS."
+                )
+            rows = tuple(
+                _dictionary_row_from_csv(raw, row_number)
+                for row_number, raw in enumerate(reader, start=2)
+            )
+    except Step04Error:
+        raise
+    except (OSError, UnicodeError, csv.Error) as exc:
+        raise Step04Error(
+            f"Could not read RTS dictionary CSV '{source}': {exc}"
+        ) from exc
+
+    coordinates: set[tuple[str, int, int]] = set()
+    for row_number, row in enumerate(rows, start=2):
+        key = (row.dataset, row.row, row.column)
+        if key in coordinates:
+            raise Step04Error(
+                f"CSV row {row_number} duplicates a dataset coordinate."
+            )
+        coordinates.add(key)
+
+    return RTSDictionaryCSV(path=source, rows=rows)
 
 
 
