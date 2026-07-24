@@ -1,12 +1,12 @@
 """Step 04: prepare an RTS dictionary analysis plan.
 
-Version 4.10.0 adds a thin lazy image/ROI analysis iterator that composes
-row-major coordinate generation with explicit-coordinate pixel analysis.
+Version 4.11.0 adds deterministic lazy filtering of final RTS candidate
+results without copying or modifying the analysis result objects.
 """
 
 from __future__ import annotations
 
-__version__ = "4.10.0"
+__version__ = "4.11.0"
 
 from dataclasses import dataclass
 
@@ -37,6 +37,7 @@ __all__ = [
     "compute_two_state_score",
     "iter_image_coordinates",
     "iter_image_rts_analyses",
+    "iter_rts_candidates",
     "iter_rts_pixel_analyses",
     "load_pixel_timeseries",
     "prepare_rts_dictionary_analysis",
@@ -417,6 +418,45 @@ def iter_image_coordinates(
         for column in range(column_start, column_stop):
             yield (row, column)
 
+
+
+def iter_rts_candidates(results):
+    """Yield only final RTS candidates from an analysis-result iterable.
+
+    Input order is preserved, duplicate object references are preserved, and
+    accepted :class:`RTSPixelAnalysisResult` instances are yielded unchanged.
+    The iterable is consumed lazily and may therefore be a one-shot generator.
+
+    Parameters
+    ----------
+    results
+        Iterable of :class:`RTSPixelAnalysisResult` objects.
+
+    Yields
+    ------
+    RTSPixelAnalysisResult
+        Original result objects whose ``is_candidate`` property is true.
+
+    Raises
+    ------
+    Step04Error
+        Lazily, when an input item is not an ``RTSPixelAnalysisResult``.
+    """
+    try:
+        iterator = iter(results)
+    except TypeError as exc:
+        raise Step04Error(
+            "results must be an iterable of RTSPixelAnalysisResult objects."
+        ) from exc
+
+    for index, result in enumerate(iterator):
+        if not isinstance(result, RTSPixelAnalysisResult):
+            raise Step04Error(
+                "results item "
+                f"{index} must be an RTSPixelAnalysisResult."
+            )
+        if result.is_candidate:
+            yield result
 
 def iter_image_rts_analyses(
     plan: RTSDictionaryPlan,
