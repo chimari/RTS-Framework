@@ -1,7 +1,7 @@
 """Step 05: prepare deterministic RTS correction plans.
 
-Version 5.7.0 adds a deterministic command-line interface for batch RTS
-correction with repeated inputs, input lists, and aggregate reporting.
+Version 5.8.0 adds deterministic persistent batch manifests in JSON and
+CSV formats for audit, provenance, and downstream automation.
 """
 
 from __future__ import annotations
@@ -10,7 +10,9 @@ from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
 import argparse
+import csv
 import hashlib
+import io
 import json
 import sys
 
@@ -32,7 +34,7 @@ from steps.step04_prepare_rts_dictionary_analysis import (
     validate_rts_dictionary_artifacts,
 )
 
-__version__ = "5.7.0"
+__version__ = "5.8.0"
 
 __all__ = [
     "RTSCandidateClassification",
@@ -54,6 +56,8 @@ __all__ = [
     "prepare_rts_correction",
     "run_rts_correction_batch",
     "run_rts_correction_batch_cli",
+    "write_rts_batch_manifest_csv",
+    "write_rts_batch_manifest_json",
     "run_rts_correction_cli",
     "write_rts_corrected_fits",
 ]
@@ -1504,6 +1508,168 @@ if __name__ == "__main__":
     raise SystemExit(run_rts_correction_cli())
 
 
+
+def _validate_batch_manifest_destination(
+    batch_result: RTSCorrectionBatchResult,
+    manifest_path: str | Path,
+    *,
+    overwrite: bool,
+) -> Path:
+    """Validate and normalize one persistent manifest path."""
+    if not isinstance(overwrite, bool):
+        raise Step05Error("overwrite must be a bool.")
+    path = Path(manifest_path).expanduser().resolve()
+    protected = {
+        *(item.input_path for item in batch_result.items),
+        *(item.output_path for item in batch_result.items),
+    }
+    if path in protected:
+        raise Step05Error(
+            f"manifest path must not overwrite a FITS artifact: '{path}'."
+        )
+    if path.exists() and not overwrite:
+        raise Step05Error(
+            f"manifest already exists and overwrite is False: '{path}'."
+        )
+    if not path.parent.exists() or not path.parent.is_dir():
+        raise Step05Error(
+            f"manifest parent directory does not exist: '{path.parent}'."
+        )
+    return path
+
+
+def _atomic_write_manifest(
+    path: Path,
+    content: str,
+    *,
+    overwrite: bool,
+) -> None:
+    """Write one UTF-8 text manifest atomically."""
+    temporary = path.with_name(f".{path.name}.tmp")
+    try:
+        if temporary.exists():
+            temporary.unlink()
+        temporary.write_text(content, encoding="utf-8", newline="\n")
+        if path.exists() and overwrite:
+            path.unlink()
+        temporary.replace(path)
+    except OSError as exc:
+        if temporary.exists():
+            temporary.unlink()
+        raise Step05Error(
+            f"Could not write manifest '{path}': {exc}"
+        ) from exc
+
+
+def write_rts_batch_manifest_json(
+    batch_result: RTSCorrectionBatchResult,
+    manifest_path: str | Path,
+    *,
+    overwrite: bool = False,
+) -> Path:
+    """Persist and verify one deterministic JSON batch manifest."""
+    if not isinstance(batch_result, RTSCorrectionBatchResult):
+        raise Step05Error(
+            "batch_result must be an RTSCorrectionBatchResult."
+        )
+    path = _validate_batch_manifest_destination(
+        batch_result, manifest_path, overwrite=overwrite
+    )
+    payload = {
+        "manifest_format": "rts-step05-batch-json",
+        "manifest_version": 1,
+        **batch_result.summary(),
+    }
+    content = json.dumps(payload, sort_keys=True, indent=2) + "\n"
+    _atomic_write_manifest(path, content, overwrite=overwrite)
+    try:
+        loaded = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        path.unlink(missing_ok=True)
+        raise Step05Error(
+            f"Could not verify JSON manifest '{path}': {exc}"
+        ) from exc
+    canonical_payload = json.loads(
+        json.dumps(
+            payload,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+    )
+    if loaded != canonical_payload:
+        path.unlink(missing_ok=True)
+        raise Step05Error(
+            f"JSON manifest verification failed: '{path}'."
+        )
+    return path
+
+
+def write_rts_batch_manifest_csv(
+    batch_result: RTSCorrectionBatchResult,
+    manifest_path: str | Path,
+    *,
+    overwrite: bool = False,
+) -> Path:
+    """Persist and verify one deterministic CSV batch manifest."""
+    if not isinstance(batch_result, RTSCorrectionBatchResult):
+        raise Step05Error(
+            "batch_result must be an RTSCorrectionBatchResult."
+        )
+    path = _validate_batch_manifest_destination(
+        batch_result, manifest_path, overwrite=overwrite
+    )
+    fieldnames = (
+        "step05_version", "metadata_path", "output_directory",
+        "continue_on_error", "overwrite", "batch_total_count",
+        "batch_succeeded_count", "batch_failed_count",
+        "batch_all_succeeded", "item_index", "input_path", "output_path",
+        "succeeded", "applied_count", "preserved_count", "sha256",
+        "verified", "error",
+    )
+    stream = io.StringIO(newline="")
+    writer = csv.DictWriter(
+        stream, fieldnames=fieldnames, lineterminator="\n"
+    )
+    writer.writeheader()
+    for index, item in enumerate(batch_result.items):
+        output = item.output.summary() if item.output is not None else {}
+        writer.writerow({
+            "step05_version": __version__,
+            "metadata_path": str(batch_result.metadata_path),
+            "output_directory": str(batch_result.output_directory),
+            "continue_on_error": batch_result.continue_on_error,
+            "overwrite": batch_result.overwrite,
+            "batch_total_count": batch_result.total_count,
+            "batch_succeeded_count": batch_result.succeeded_count,
+            "batch_failed_count": batch_result.failed_count,
+            "batch_all_succeeded": batch_result.all_succeeded,
+            "item_index": index,
+            "input_path": str(item.input_path),
+            "output_path": str(item.output_path),
+            "succeeded": item.succeeded,
+            "applied_count": output.get("applied_count", ""),
+            "preserved_count": output.get("preserved_count", ""),
+            "sha256": output.get("sha256", ""),
+            "verified": output.get("verified", ""),
+            "error": item.error or "",
+        })
+    _atomic_write_manifest(path, stream.getvalue(), overwrite=overwrite)
+    try:
+        with path.open("r", encoding="utf-8", newline="") as handle:
+            rows = list(csv.DictReader(handle))
+    except (OSError, csv.Error) as exc:
+        path.unlink(missing_ok=True)
+        raise Step05Error(
+            f"Could not verify CSV manifest '{path}': {exc}"
+        ) from exc
+    if len(rows) != batch_result.total_count:
+        path.unlink(missing_ok=True)
+        raise Step05Error(
+            f"CSV manifest verification failed: '{path}'."
+        )
+    return path
+
+
 def _build_rts_correction_batch_cli_parser() -> argparse.ArgumentParser:
     """Build the Step 05 batch command-line parser."""
     parser = argparse.ArgumentParser(
@@ -1575,6 +1741,16 @@ def _build_rts_correction_batch_cli_parser() -> argparse.ArgumentParser:
         action="store_true",
         dest="json_output",
         help="Write one machine-readable JSON summary to stdout.",
+    )
+    parser.add_argument(
+        "--manifest-json",
+        dest="manifest_json",
+        help="Write a persistent JSON batch manifest to this path.",
+    )
+    parser.add_argument(
+        "--manifest-csv",
+        dest="manifest_csv",
+        help="Write a persistent CSV batch manifest to this path.",
     )
     parser.add_argument(
         "--version",
@@ -1653,6 +1829,32 @@ def run_rts_correction_batch_cli(
                     separators=(",", ":"),
                 )
             )
+        elif not args.quiet:
+            print(f"ERROR: {exc}", file=sys.stderr)
+        return 1
+
+
+    try:
+        if args.manifest_json is not None:
+            write_rts_batch_manifest_json(
+                result, args.manifest_json, overwrite=args.overwrite
+            )
+        if args.manifest_csv is not None:
+            write_rts_batch_manifest_csv(
+                result, args.manifest_csv, overwrite=args.overwrite
+            )
+    except Step05Error as exc:
+        if args.json_output:
+            print(json.dumps(
+                {
+                    "step05_version": __version__,
+                    "status": "ERROR",
+                    "exit_code": 1,
+                    "error": str(exc),
+                },
+                sort_keys=True,
+                separators=(",", ":"),
+            ))
         elif not args.quiet:
             print(f"ERROR: {exc}", file=sys.stderr)
         return 1
