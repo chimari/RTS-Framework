@@ -7,10 +7,11 @@ No image pixels are read in this step.
 
 from __future__ import annotations
 
-__version__ = "2.4.0"
+__version__ = "2.5.0"
 
 import argparse
 import csv
+import json
 from dataclasses import dataclass
 from pathlib import Path
 import os
@@ -596,6 +597,130 @@ def write_statistics_csv(
 def _format_float(value: float) -> str:
     """Return a stable round-trippable decimal representation."""
     return format(float(value), ".17g")
+
+
+def build_statistics_summary(
+    group: DatasetGroup,
+    statistics: DatasetStatistics,
+) -> dict[str, object]:
+    """Build a canonical JSON-serializable summary for one dataset."""
+    if group.name != statistics.dataset:
+        raise Step02Error(
+            "Dataset group and statistics names do not match: "
+            f"group={group.name!r}, statistics={statistics.dataset!r}."
+        )
+    if group.n_frames != statistics.n_frames:
+        raise Step02Error(
+            "Dataset group and statistics frame counts do not match: "
+            f"dataset={group.name!r}, "
+            f"group_frames={group.n_frames}, "
+            f"statistics_frames={statistics.n_frames}."
+        )
+
+    frames = statistics.frames
+    image_height, image_width = group.image_shape
+    byte_order = group.frames[0].byte_order
+
+    return {
+        "schema": "rts-framework.step02.statistics-summary",
+        "schema_version": 1,
+        "dataset": group.name,
+        "n_frames": group.n_frames,
+        "image": {
+            "width": image_width,
+            "height": image_height,
+            "shape": [image_height, image_width],
+            "pixel_dtype": group.pixel_dtype,
+            "byte_order": byte_order,
+        },
+        "exposure_s": {
+            "minimum": min(frame.exposure_s for frame in frames),
+            "maximum": max(frame.exposure_s for frame in frames),
+        },
+        "temperature_C": {
+            "minimum": min(frame.temperature_C for frame in frames),
+            "maximum": max(frame.temperature_C for frame in frames),
+        },
+        "frame_statistics": {
+            "minimum": {
+                "minimum": min(frame.minimum for frame in frames),
+                "maximum": max(frame.minimum for frame in frames),
+            },
+            "maximum": {
+                "minimum": min(frame.maximum for frame in frames),
+                "maximum": max(frame.maximum for frame in frames),
+            },
+            "mean": {
+                "minimum": min(frame.mean for frame in frames),
+                "maximum": max(frame.mean for frame in frames),
+            },
+            "median": {
+                "minimum": min(frame.median for frame in frames),
+                "maximum": max(frame.median for frame in frames),
+            },
+            "stddev": {
+                "minimum": min(frame.stddev for frame in frames),
+                "maximum": max(frame.stddev for frame in frames),
+            },
+            "finite_pixels": {
+                "minimum": min(frame.finite_pixels for frame in frames),
+                "maximum": max(frame.finite_pixels for frame in frames),
+            },
+            "total_pixels": {
+                "minimum": min(frame.total_pixels for frame in frames),
+                "maximum": max(frame.total_pixels for frame in frames),
+            },
+        },
+    }
+
+
+def write_statistics_summary_json(
+    group: DatasetGroup,
+    statistics: DatasetStatistics,
+    output_path: str | Path,
+) -> Path:
+    """Write a deterministic dataset statistics summary as JSON."""
+    path = Path(output_path)
+    payload = build_statistics_summary(group, statistics)
+    temporary_path: Path | None = None
+
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            newline="\n",
+            dir=path.parent,
+            prefix=f".{path.name}.",
+            suffix=".tmp",
+            delete=False,
+        ) as stream:
+            temporary_path = Path(stream.name)
+            json.dump(
+                payload,
+                stream,
+                ensure_ascii=False,
+                indent=2,
+                sort_keys=True,
+                allow_nan=False,
+            )
+            stream.write("\n")
+            stream.flush()
+            os.fsync(stream.fileno())
+
+        temporary_path.replace(path)
+        temporary_path = None
+    except (OSError, TypeError, ValueError) as exc:
+        if temporary_path is not None:
+            try:
+                temporary_path.unlink(missing_ok=True)
+            except OSError:
+                pass
+        raise Step02Error(
+            f"Unable to write Step 02 statistics summary JSON: {path}: {exc}"
+        ) from exc
+
+    return path
 
 def statistics_filename(dataset: str) -> str:
     """Return a deterministic filesystem-safe CSV filename for a dataset."""
