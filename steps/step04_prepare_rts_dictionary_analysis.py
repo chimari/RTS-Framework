@@ -1,7 +1,7 @@
 """Step 04: prepare an RTS dictionary analysis plan.
 
-Version 4.15.0 adds an immutable build result for reporting the output
-path, analyzed region, analyzed pixel count, and final candidate count.
+Version 4.16.0 adds deterministic optional progress callbacks for the
+high-level image-to-CSV build APIs without changing RTS analysis logic.
 """
 
 from __future__ import annotations
@@ -12,7 +12,7 @@ import csv
 import os
 import tempfile
 
-__version__ = "4.15.0"
+__version__ = "4.16.0"
 
 from dataclasses import dataclass
 
@@ -522,6 +522,7 @@ def build_rts_dictionary_csv(
     minimum_transition_count: int = 0,
     minimum_lower_run: int = 1,
     minimum_upper_run: int = 1,
+    progress_callback=None,
 ) -> Path:
     """Analyze an image region and atomically write its final RTS candidates.
 
@@ -542,6 +543,7 @@ def build_rts_dictionary_csv(
         minimum_transition_count=minimum_transition_count,
         minimum_lower_run=minimum_lower_run,
         minimum_upper_run=minimum_upper_run,
+        progress_callback=progress_callback,
     )
     return result.output_path
 
@@ -560,6 +562,7 @@ def build_rts_dictionary_csv_result(
     minimum_transition_count: int = 0,
     minimum_lower_run: int = 1,
     minimum_upper_run: int = 1,
+    progress_callback=None,
 ) -> RTSDictionaryBuildResult:
     """Build an RTS dictionary CSV and return immutable execution metadata.
 
@@ -589,6 +592,27 @@ def build_rts_dictionary_csv_result(
     )
     next(validation_iterator, None)
 
+    if progress_callback is not None and not callable(progress_callback):
+        raise Step04Error("progress_callback must be callable or None.")
+
+    total_pixel_count = (
+        (resolved_row_stop - resolved_row_start)
+        * (resolved_column_stop - resolved_column_start)
+    )
+
+    def notify_progress(completed: int) -> None:
+        if progress_callback is None:
+            return
+        try:
+            progress_callback(completed, total_pixel_count)
+        except Exception as exc:
+            raise Step04Error(
+                f"progress_callback failed at {completed}/"
+                f"{total_pixel_count}: {exc}"
+            ) from exc
+
+    notify_progress(0)
+
     analyzed_pixel_count = 0
     candidate_count = 0
 
@@ -610,6 +634,7 @@ def build_rts_dictionary_csv_result(
         nonlocal analyzed_pixel_count
         for analysis in analyses:
             analyzed_pixel_count += 1
+            notify_progress(analyzed_pixel_count)
             yield analysis
 
     candidates = iter_rts_candidates(counted_analyses())
