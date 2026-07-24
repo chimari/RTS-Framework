@@ -1,7 +1,7 @@
 """Step 05: prepare deterministic RTS correction plans.
 
-Version 5.4.0 writes an in-memory correction result to a new verified FITS
-artifact while preserving the input FITS file.
+Version 5.5.0 adds a deterministic command-line interface that runs the
+complete Step 05 correction pipeline and writes a verified FITS artifact.
 """
 
 from __future__ import annotations
@@ -9,10 +9,21 @@ from __future__ import annotations
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
+import argparse
 import hashlib
+import json
+import sys
 
 import numpy as np
 from astropy.io import fits
+
+# Support both package import and direct execution:
+#   python -m steps.step05_apply_rts_correction --version
+#   python steps/step05_apply_rts_correction.py --version
+if __package__ in (None, ""):
+    project_root = Path(__file__).resolve().parents[1]
+    if str(project_root) not in sys.path:
+        sys.path.insert(0, str(project_root))
 
 from steps.step04_prepare_rts_dictionary_analysis import (
     RTSDictionaryArtifactValidation,
@@ -21,7 +32,7 @@ from steps.step04_prepare_rts_dictionary_analysis import (
     validate_rts_dictionary_artifacts,
 )
 
-__version__ = "5.4.0"
+__version__ = "5.5.0"
 
 __all__ = [
     "RTSCandidateClassification",
@@ -39,6 +50,7 @@ __all__ = [
     "build_rts_correction_decisions",
     "classify_rts_correction_candidates",
     "prepare_rts_correction",
+    "run_rts_correction_cli",
     "write_rts_corrected_fits",
 ]
 
@@ -1119,3 +1131,157 @@ def write_rts_corrected_fits(
         pixel_dtype=application_result.output_dtype,
         history_entries=history_entries,
     )
+
+
+def _build_rts_correction_cli_parser() -> argparse.ArgumentParser:
+    """Build the Step 05 command-line parser."""
+    parser = argparse.ArgumentParser(
+        prog="step05_apply_rts_correction",
+        description=(
+            "Validate an RTS dictionary, classify candidate pixels, "
+            "apply safe corrections in memory, and write a verified FITS."
+        ),
+    )
+    parser.add_argument(
+        "--metadata",
+        required=True,
+        help="Path to the Step 04 RTS dictionary metadata JSON.",
+    )
+    parser.add_argument(
+        "--input",
+        required=True,
+        dest="input_path",
+        help="Path to the input FITS image.",
+    )
+    parser.add_argument(
+        "--output",
+        required=True,
+        dest="output_path",
+        help="Path for the corrected FITS image.",
+    )
+    parser.add_argument(
+        "--state-tolerance-fraction",
+        type=float,
+        default=0.25,
+        help=(
+            "Fraction of state separation used for LOWER/UPPER "
+            "classification tolerance (default: 0.25)."
+        ),
+    )
+    parser.add_argument(
+        "--overwrite",
+        action="store_true",
+        help="Allow replacement of an existing output file.",
+    )
+    parser.add_argument(
+        "--quiet",
+        action="store_true",
+        help="Suppress human-readable success and error output.",
+    )
+    parser.add_argument(
+        "--json",
+        action="store_true",
+        dest="json_output",
+        help="Write one machine-readable JSON object to stdout.",
+    )
+    parser.add_argument(
+        "--version",
+        action="version",
+        version=f"%(prog)s {__version__}",
+    )
+    return parser
+
+
+def _rts_correction_cli_summary(
+    output: RTSCorrectionOutput,
+    classification: RTSCorrectionClassificationResult,
+) -> dict[str, object]:
+    """Return the deterministic machine-readable CLI summary."""
+    return {
+        **output.summary(),
+        "status": "OK",
+        "exit_code": 0,
+        "state_tolerance_fraction": (
+            classification.state_tolerance_fraction
+        ),
+        "candidate_count": classification.candidate_count,
+        "lower_count": classification.lower_count,
+        "upper_count": classification.upper_count,
+        "midpoint_count": classification.midpoint_count,
+        "outside_count": classification.outside_count,
+    }
+
+
+def run_rts_correction_cli(
+    argv: list[str] | tuple[str, ...] | None = None,
+) -> int:
+    """Run the complete Step 05 correction pipeline.
+
+    Exit codes:
+        0: success
+        1: operational or validation failure
+        2: argument parsing failure from argparse
+    """
+    parser = _build_rts_correction_cli_parser()
+    args = parser.parse_args(argv)
+
+    try:
+        plan = prepare_rts_correction(args.metadata, args.input_path)
+        classification = classify_rts_correction_candidates(
+            plan,
+            state_tolerance_fraction=args.state_tolerance_fraction,
+        )
+        decisions = build_rts_correction_decisions(classification)
+        application = apply_rts_correction_in_memory(decisions)
+        output = write_rts_corrected_fits(
+            application,
+            args.output_path,
+            overwrite=args.overwrite,
+        )
+    except Step05Error as exc:
+        if args.json_output:
+            print(
+                json.dumps(
+                    {
+                        "step05_version": __version__,
+                        "status": "ERROR",
+                        "exit_code": 1,
+                        "error": str(exc),
+                    },
+                    sort_keys=True,
+                    separators=(",", ":"),
+                )
+            )
+        elif not args.quiet:
+            print(f"ERROR: {exc}", file=sys.stderr)
+        return 1
+
+    summary = _rts_correction_cli_summary(output, classification)
+
+    if args.json_output:
+        print(
+            json.dumps(
+                summary,
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+        )
+    elif not args.quiet:
+        print("RTS correction completed")
+        print(f"Input FITS     : {output.input_path}")
+        print(f"Output FITS    : {output.output_path}")
+        print(f"Candidates     : {classification.candidate_count}")
+        print(f"Corrected      : {output.applied_count}")
+        print(f"Preserved      : {output.preserved_count}")
+        print(f"LOWER          : {classification.lower_count}")
+        print(f"UPPER          : {classification.upper_count}")
+        print(f"MIDPOINT       : {classification.midpoint_count}")
+        print(f"OUTSIDE        : {classification.outside_count}")
+        print(f"SHA256         : {output.sha256}")
+        print("Verified       : True")
+
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(run_rts_correction_cli())
