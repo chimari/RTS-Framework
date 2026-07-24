@@ -1,12 +1,12 @@
 """Step 04: prepare an RTS dictionary analysis plan.
 
-Version 4.6.0 adds deterministic temporal RTS-candidate classification by
-combining an existing RTSCandidateResult with TwoStateTransitionResult.
+Version 4.7.0 adds a thin single-pixel orchestration layer that composes the
+existing loading, statistics, scoring, candidate, and transition APIs.
 """
 
 from __future__ import annotations
 
-__version__ = "4.6.0"
+__version__ = "4.7.0"
 
 from dataclasses import dataclass
 
@@ -24,10 +24,12 @@ __all__ = [
     "PixelTimeSeriesStatistics",
     "RTSCandidateResult",
     "RTSDictionaryPlan",
+    "RTSPixelAnalysisResult",
     "Step04Error",
     "TemporalRTSCandidateResult",
     "TwoStateScoreResult",
     "TwoStateTransitionResult",
+    "analyze_rts_pixel",
     "analyze_two_state_transitions",
     "classify_rts_candidate",
     "classify_temporal_rts_candidate",
@@ -46,6 +48,39 @@ class Step04Error(Exception):
 
 
 
+
+
+
+@dataclass(slots=True, frozen=True)
+class RTSPixelAnalysisResult:
+    """Immutable aggregate of every Step 04 result for one pixel."""
+
+    series: "PixelTimeSeries"
+    statistics: "PixelTimeSeriesStatistics"
+    score: "TwoStateScoreResult"
+    candidate: "RTSCandidateResult"
+    transitions: "TwoStateTransitionResult"
+    temporal_candidate: "TemporalRTSCandidateResult"
+
+    @property
+    def is_candidate(self) -> bool:
+        """Return the final temporal RTS-candidate decision."""
+        return self.temporal_candidate.is_candidate
+
+    def summary(self) -> dict[str, object]:
+        """Return a canonical JSON-serializable one-pixel analysis summary."""
+        return {
+            "dataset": self.series.dataset,
+            "row": self.series.row,
+            "column": self.series.column,
+            "n_frames": self.series.n_frames,
+            "statistics": self.statistics.summary(),
+            "score": self.score.summary(),
+            "candidate": self.candidate.summary(),
+            "transitions": self.transitions.summary(),
+            "temporal_candidate": self.temporal_candidate.summary(),
+            "is_candidate": self.is_candidate,
+        }
 
 
 @dataclass(slots=True, frozen=True)
@@ -299,6 +334,80 @@ class RTSDictionaryPlan:
 
 
 
+
+
+def analyze_rts_pixel(
+    plan: RTSDictionaryPlan,
+    *,
+    row: int,
+    column: int,
+    minimum_score: float,
+    minimum_state_count: int,
+    minimum_separation: float,
+    minimum_transition_count: int,
+    minimum_lower_run: int,
+    minimum_upper_run: int,
+) -> RTSPixelAnalysisResult:
+    """Run the existing Step 04 analysis pipeline for exactly one pixel.
+
+    This function is a thin orchestration layer. It adds no new scoring or
+    classification rules. The following public APIs are called in order:
+
+    1. :func:`load_pixel_timeseries`
+    2. :func:`compute_pixel_timeseries_statistics`
+    3. :func:`compute_two_state_score`
+    4. :func:`classify_rts_candidate`
+    5. :func:`analyze_two_state_transitions`
+    6. :func:`classify_temporal_rts_candidate`
+
+    Parameters
+    ----------
+    plan
+        Plan returned by :func:`prepare_rts_dictionary_analysis`.
+    row, column
+        Zero-based pixel coordinates.
+    minimum_score, minimum_state_count, minimum_separation
+        Thresholds forwarded unchanged to :func:`classify_rts_candidate`.
+    minimum_transition_count, minimum_lower_run, minimum_upper_run
+        Thresholds forwarded unchanged to
+        :func:`classify_temporal_rts_candidate`.
+
+    Returns
+    -------
+    RTSPixelAnalysisResult
+        Immutable aggregate retaining every intermediate result.
+
+    Raises
+    ------
+    Step04Error
+        Propagated unchanged from the underlying public APIs.
+    """
+    series = load_pixel_timeseries(plan, row=row, column=column)
+    statistics = compute_pixel_timeseries_statistics(series)
+    score = compute_two_state_score(series)
+    candidate = classify_rts_candidate(
+        score,
+        minimum_score=minimum_score,
+        minimum_state_count=minimum_state_count,
+        minimum_separation=minimum_separation,
+    )
+    transitions = analyze_two_state_transitions(series, score)
+    temporal_candidate = classify_temporal_rts_candidate(
+        candidate,
+        transitions,
+        minimum_transition_count=minimum_transition_count,
+        minimum_lower_run=minimum_lower_run,
+        minimum_upper_run=minimum_upper_run,
+    )
+
+    return RTSPixelAnalysisResult(
+        series=series,
+        statistics=statistics,
+        score=score,
+        candidate=candidate,
+        transitions=transitions,
+        temporal_candidate=temporal_candidate,
+    )
 
 def classify_temporal_rts_candidate(
     candidate_result: RTSCandidateResult,
