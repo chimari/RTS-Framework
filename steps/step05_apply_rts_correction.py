@@ -1,7 +1,7 @@
 """Step 05: prepare deterministic RTS correction plans.
 
-Version 5.3.0 applies correctable decisions to an independent in-memory
-image copy while preserving the input FITS file.
+Version 5.4.0 writes an in-memory correction result to a new verified FITS
+artifact while preserving the input FITS file.
 """
 
 from __future__ import annotations
@@ -9,6 +9,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
+import hashlib
 
 import numpy as np
 from astropy.io import fits
@@ -20,7 +21,7 @@ from steps.step04_prepare_rts_dictionary_analysis import (
     validate_rts_dictionary_artifacts,
 )
 
-__version__ = "5.3.0"
+__version__ = "5.4.0"
 
 __all__ = [
     "RTSCandidateClassification",
@@ -31,12 +32,14 @@ __all__ = [
     "RTSCorrectionDecision",
     "RTSCorrectionDecisionReason",
     "RTSCorrectionDecisionResult",
+    "RTSCorrectionOutput",
     "RTSCorrectionPlan",
     "Step05Error",
     "apply_rts_correction_in_memory",
     "build_rts_correction_decisions",
     "classify_rts_correction_candidates",
     "prepare_rts_correction",
+    "write_rts_corrected_fits",
 ]
 
 
@@ -391,6 +394,78 @@ class RTSCorrectionApplicationResult:
             "decision_count": self.decision_result.decision_count,
             "applied_count": self.applied_count,
             "preserved_count": self.preserved_count,
+        }
+
+
+
+@dataclass(slots=True, frozen=True)
+class RTSCorrectionOutput:
+    """Immutable description of one verified corrected FITS artifact."""
+
+    application_result: RTSCorrectionApplicationResult
+    output_path: Path
+    sha256: str
+    image_shape: tuple[int, int]
+    pixel_dtype: str
+    history_entries: tuple[str, ...]
+    written: bool = True
+    verified: bool = True
+
+    def __post_init__(self) -> None:
+        output_path = Path(self.output_path).expanduser().resolve()
+        object.__setattr__(self, "output_path", output_path)
+
+        if len(self.sha256) != 64:
+            raise Step05Error("sha256 must contain 64 hexadecimal characters.")
+        try:
+            int(self.sha256, 16)
+        except ValueError as exc:
+            raise Step05Error("sha256 is not hexadecimal.") from exc
+
+        if self.image_shape != self.application_result.plan.image_shape:
+            raise Step05Error(
+                "output image_shape does not match the correction plan."
+            )
+        if self.pixel_dtype != self.application_result.output_dtype:
+            raise Step05Error(
+                "output pixel_dtype does not match the application result."
+            )
+        if not self.history_entries:
+            raise Step05Error("history_entries must not be empty.")
+        if not self.written or not self.verified:
+            raise Step05Error(
+                "RTSCorrectionOutput requires a written and verified artifact."
+            )
+
+    @property
+    def input_path(self) -> Path:
+        """Return the source FITS path."""
+        return self.application_result.plan.input_path
+
+    @property
+    def applied_count(self) -> int:
+        """Return the number of corrected candidate pixels."""
+        return self.application_result.applied_count
+
+    @property
+    def preserved_count(self) -> int:
+        """Return the number of preserved candidate pixels."""
+        return self.application_result.preserved_count
+
+    def summary(self) -> dict[str, object]:
+        """Return one deterministic JSON-serializable output summary."""
+        return {
+            "step05_version": __version__,
+            "input_path": str(self.input_path),
+            "output_path": str(self.output_path),
+            "written": self.written,
+            "verified": self.verified,
+            "sha256": self.sha256,
+            "image_shape": self.image_shape,
+            "pixel_dtype": self.pixel_dtype,
+            "applied_count": self.applied_count,
+            "preserved_count": self.preserved_count,
+            "history_entries": self.history_entries,
         }
 
 
@@ -874,4 +949,173 @@ def apply_rts_correction_in_memory(
         applied_count=applied_count,
         preserved_count=preserved_count,
         output_dtype=output_dtype.name,
+    )
+
+
+def _sha256_file(path: Path) -> str:
+    """Return the SHA256 digest of one file."""
+    digest = hashlib.sha256()
+    try:
+        with path.open("rb") as stream:
+            for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+                digest.update(chunk)
+    except OSError as exc:
+        raise Step05Error(
+            f"Could not calculate SHA256 for '{path}': {exc}"
+        ) from exc
+    return digest.hexdigest()
+
+
+def _read_primary_header(path: Path) -> fits.Header:
+    """Read and copy the source primary FITS header."""
+    try:
+        with fits.open(
+            path,
+            mode="readonly",
+            memmap=False,
+            do_not_scale_image_data=False,
+            uint=True,
+        ) as hdul:
+            if hdul[0].data is None or hdul[0].data.ndim != 2:
+                raise Step05Error(
+                    "input FITS primary image is no longer two-dimensional."
+                )
+            return hdul[0].header.copy()
+    except Step05Error:
+        raise
+    except (OSError, ValueError, TypeError) as exc:
+        raise Step05Error(
+            f"Could not read input FITS header '{path}': {exc}"
+        ) from exc
+
+
+def _verify_written_rts_fits(
+    output_path: Path,
+    application_result: RTSCorrectionApplicationResult,
+) -> None:
+    """Verify shape, dtype, and pixel values of a written FITS artifact."""
+    expected = application_result.corrected_image
+    try:
+        with fits.open(
+            output_path,
+            mode="readonly",
+            memmap=False,
+            do_not_scale_image_data=False,
+            uint=True,
+        ) as hdul:
+            data = hdul[0].data
+            if data is None or data.ndim != 2:
+                raise Step05Error(
+                    "written FITS primary image is not two-dimensional."
+                )
+            actual = np.asarray(data)
+    except Step05Error:
+        raise
+    except (OSError, ValueError, TypeError) as exc:
+        raise Step05Error(
+            f"Could not verify corrected FITS '{output_path}': {exc}"
+        ) from exc
+
+    actual_shape = tuple(int(value) for value in actual.shape)
+    if actual_shape != application_result.plan.image_shape:
+        raise Step05Error(
+            "written FITS shape verification failed: "
+            f"expected {application_result.plan.image_shape}, "
+            f"got {actual_shape}."
+        )
+
+    if actual.dtype.name != application_result.output_dtype:
+        raise Step05Error(
+            "written FITS dtype verification failed: "
+            f"expected {application_result.output_dtype}, "
+            f"got {actual.dtype.name}."
+        )
+
+    if not np.array_equal(actual, expected, equal_nan=True):
+        raise Step05Error(
+            "written FITS pixel verification failed."
+        )
+
+
+def write_rts_corrected_fits(
+    application_result: RTSCorrectionApplicationResult,
+    output_path: str | Path,
+    *,
+    overwrite: bool = False,
+) -> RTSCorrectionOutput:
+    """Write and verify a corrected FITS artifact.
+
+    The source FITS file is never modified.  By default, an existing output
+    path is rejected.  The source primary header is copied, RTS provenance is
+    appended with HISTORY cards, and the written image is re-read for exact
+    shape, dtype, and pixel verification.
+    """
+    if not isinstance(application_result, RTSCorrectionApplicationResult):
+        raise Step05Error(
+            "application_result must be an "
+            "RTSCorrectionApplicationResult."
+        )
+    if not isinstance(overwrite, bool):
+        raise Step05Error("overwrite must be a bool.")
+
+    destination = Path(output_path).expanduser().resolve()
+    source = application_result.plan.input_path.expanduser().resolve()
+
+    if destination == source:
+        raise Step05Error("output_path must not overwrite the input FITS.")
+
+    if destination.exists() and not overwrite:
+        raise Step05Error(
+            f"output FITS already exists: '{destination}'."
+        )
+
+    if not destination.parent.exists():
+        raise Step05Error(
+            f"output directory does not exist: '{destination.parent}'."
+        )
+    if not destination.parent.is_dir():
+        raise Step05Error(
+            f"output parent is not a directory: '{destination.parent}'."
+        )
+
+    header = _read_primary_header(source)
+    history_entries = (
+        "RTS correction applied",
+        f"RTS Framework {__version__}",
+        f"RTS corrected pixels = {application_result.applied_count}",
+        f"RTS preserved candidates = {application_result.preserved_count}",
+    )
+    for entry in history_entries:
+        header.add_history(entry)
+
+    hdu = fits.PrimaryHDU(
+        data=np.array(application_result.corrected_image, copy=True),
+        header=header,
+    )
+
+    try:
+        hdu.writeto(destination, overwrite=overwrite, checksum=True)
+    except (OSError, ValueError, TypeError) as exc:
+        raise Step05Error(
+            f"Could not write corrected FITS '{destination}': {exc}"
+        ) from exc
+
+    try:
+        _verify_written_rts_fits(destination, application_result)
+        digest = _sha256_file(destination)
+    except Exception:
+        # Avoid leaving an unverified artifact from this call.
+        try:
+            destination.unlink(missing_ok=True)
+        except OSError:
+            pass
+        raise
+
+    return RTSCorrectionOutput(
+        application_result=application_result,
+        output_path=destination,
+        sha256=digest,
+        image_shape=application_result.plan.image_shape,
+        pixel_dtype=application_result.output_dtype,
+        history_entries=history_entries,
     )
