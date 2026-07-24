@@ -7,7 +7,7 @@ No image pixels are read in this step.
 
 from __future__ import annotations
 
-__version__ = "2.5.0"
+__version__ = "2.6.0"
 
 import argparse
 import csv
@@ -792,6 +792,72 @@ def write_all_statistics_csv(
     return tuple(written)
 
 
+
+def statistics_summary_filename(dataset: str) -> str:
+    """Return a deterministic filesystem-safe JSON filename for a dataset."""
+    stem = re.sub(r"[^A-Za-z0-9._-]+", "_", dataset.strip())
+    stem = stem.strip("._-")
+    if not stem:
+        stem = "dataset"
+    return f"{stem}.json"
+
+
+def write_all_statistics_summary_json(
+    result: Step02Result,
+    output_dir: str | Path,
+    *,
+    quiet: bool = False,
+) -> tuple[Path, ...]:
+    """Compute and write one statistics-summary JSON per dataset.
+
+    All image statistics are computed before any output file is written. This
+    prevents read or validation failures from leaving a partially generated
+    output set.
+    """
+    directory = Path(output_dir)
+    computed: list[tuple[DatasetGroup, DatasetStatistics]] = []
+    filenames: dict[str, str] = {}
+
+    for group_index, group in enumerate(result.groups, start=1):
+        filename = statistics_summary_filename(group.name)
+        previous = filenames.get(filename)
+        if previous is not None and previous != group.name:
+            raise Step02Error(
+                "Dataset names map to the same statistics-summary filename: "
+                f"{previous!r} and {group.name!r} -> {filename!r}."
+            )
+        filenames[filename] = group.name
+
+        if not quiet:
+            print(
+                f"[{group_index}/{result.n_datasets}] "
+                f"{group.name}: {group.n_frames} frames"
+            )
+
+        def progress(
+            current: int,
+            total: int,
+            frame: FrameRecord,
+        ) -> None:
+            if not quiet:
+                print(
+                    f"  frame {current}/{total}: {frame.filepath.name}",
+                    flush=True,
+                )
+
+        statistics = compute_dataset_statistics(group, progress=progress)
+        computed.append((group, statistics))
+
+    written: list[Path] = []
+    for group, statistics in computed:
+        path = directory / statistics_summary_filename(group.name)
+        write_statistics_summary_json(group, statistics, path)
+        written.append(path)
+        if not quiet:
+            print(f"  wrote: {path}")
+
+    return tuple(written)
+
 def build_argument_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="python -m steps.step02_prepare_frame_groups",
@@ -804,6 +870,12 @@ def build_argument_parser() -> argparse.ArgumentParser:
         type=Path,
         default=None,
         help="Compute per-frame statistics and write one CSV per dataset.",
+    )
+    parser.add_argument(
+        "--summary-dir",
+        type=Path,
+        default=None,
+        help="Compute statistics and write one summary JSON per dataset.",
     )
     parser.add_argument(
         "--quiet",
@@ -829,6 +901,12 @@ def main(argv: Sequence[str] | None = None) -> int:
             write_all_statistics_csv(
                 result,
                 args.statistics_dir,
+                quiet=args.quiet,
+            )
+        if args.summary_dir is not None:
+            write_all_statistics_summary_json(
+                result,
+                args.summary_dir,
                 quiet=args.quiet,
             )
     except Step02Error as exc:
