@@ -17,7 +17,7 @@ import os
 import sys
 import tempfile
 
-__version__ = "4.35.0"
+__version__ = "4.36.0"
 
 from dataclasses import dataclass
 from enum import Enum
@@ -41,6 +41,7 @@ __all__ = [
     "RTSDictionaryRow",
     "RTSDictionaryCSV",
     "RTSDictionaryArtifacts",
+    "RTSDictionaryArtifactValidation",
     "RTSInputFileValidation",
     "RTSInputFileFingerprint",
     "RTSInputFileFingerprintSet",
@@ -76,6 +77,7 @@ __all__ = [
     "load_rts_dictionary_metadata_json",
     "load_rts_dictionary_csv",
     "load_rts_dictionary_artifacts",
+    "validate_rts_dictionary_artifacts",
     "validate_rts_dictionary_input_files",
     "fingerprint_rts_dictionary_input_files",
     "write_rts_input_file_fingerprints_json",
@@ -660,6 +662,52 @@ class RTSDictionaryArtifacts:
             "candidate_count": self.candidate_count,
             "dictionary": self.dictionary.summary(),
             "metadata": self.metadata.summary(),
+        }
+
+
+
+@dataclass(slots=True, frozen=True)
+class RTSDictionaryArtifactValidation:
+    """Immutable validated complete Step 04 dictionary artifact set."""
+
+    artifacts: RTSDictionaryArtifacts
+    fingerprints: "RTSInputFileFingerprintSet"
+    comparison: "RTSInputFileFingerprintComparison"
+    fingerprint_json_path: Path
+    comparison_json_path: Path
+
+    @property
+    def metadata_path(self) -> Path:
+        """Return the validated metadata sidecar path."""
+        return self.artifacts.metadata.metadata_path
+
+    @property
+    def dictionary_csv_path(self) -> Path:
+        """Return the validated dictionary CSV path."""
+        return self.artifacts.dictionary.path
+
+    @property
+    def candidate_count(self) -> int:
+        """Return the validated dictionary candidate count."""
+        return self.artifacts.candidate_count
+
+    @property
+    def input_file_count(self) -> int:
+        """Return the validated input-file count."""
+        return self.fingerprints.file_count
+
+    def summary(self) -> dict[str, object]:
+        """Return a deterministic JSON-serializable validation summary."""
+        return {
+            "metadata_path": str(self.metadata_path),
+            "dictionary_csv_path": str(self.dictionary_csv_path),
+            "fingerprint_json_path": str(self.fingerprint_json_path),
+            "comparison_json_path": str(self.comparison_json_path),
+            "dataset": self.artifacts.dataset,
+            "candidate_count": self.candidate_count,
+            "input_file_count": self.input_file_count,
+            "fingerprint_algorithm": self.fingerprints.algorithm,
+            "comparison_matches": self.comparison.matches,
         }
 
 
@@ -2796,6 +2844,142 @@ def load_rts_input_file_comparison_json(
     return result
 
 
+
+
+
+def validate_rts_dictionary_artifacts(
+    metadata_path,
+    *,
+    fingerprint_json_path=None,
+    comparison_json_path=None,
+) -> RTSDictionaryArtifactValidation:
+    """Load and cross-validate a complete Step 04 artifact set.
+
+    The complete set consists of the dictionary CSV referenced by metadata,
+    the metadata JSON itself, the baseline fingerprint JSON, and the input
+    comparison JSON. No files are created or modified.
+    """
+    try:
+        resolved_metadata_path = Path(metadata_path)
+    except TypeError as exc:
+        raise Step04Error("metadata_path must be path-like.") from exc
+
+    metadata = load_rts_dictionary_metadata_json(resolved_metadata_path)
+    artifacts = load_rts_dictionary_artifacts(
+        metadata.csv_path,
+        metadata.metadata_path,
+    )
+
+    if fingerprint_json_path is None:
+        resolved_fingerprint_path = _default_fingerprint_json_path(
+            metadata.metadata_path
+        )
+    else:
+        try:
+            resolved_fingerprint_path = Path(fingerprint_json_path)
+        except TypeError as exc:
+            raise Step04Error(
+                "fingerprint_json_path must be path-like or None."
+            ) from exc
+
+    if comparison_json_path is None:
+        resolved_comparison_path = _default_comparison_json_path(
+            metadata.metadata_path
+        )
+    else:
+        try:
+            resolved_comparison_path = Path(comparison_json_path)
+        except TypeError as exc:
+            raise Step04Error(
+                "comparison_json_path must be path-like or None."
+            ) from exc
+
+    fingerprints = load_rts_input_file_fingerprints_json(
+        resolved_fingerprint_path
+    )
+    comparison = load_rts_input_file_comparison_json(
+        resolved_comparison_path
+    )
+
+    normalized_metadata = _normalized_artifact_path(metadata.metadata_path)
+    if _normalized_artifact_path(fingerprints.metadata_path) != (
+        normalized_metadata
+    ):
+        raise Step04Error(
+            "fingerprint metadata_path does not match dictionary metadata."
+        )
+    if _normalized_artifact_path(comparison.metadata_path) != (
+        normalized_metadata
+    ):
+        raise Step04Error(
+            "comparison metadata_path does not match dictionary metadata."
+        )
+
+    if fingerprints.algorithm != comparison.algorithm:
+        raise Step04Error(
+            "fingerprint and comparison algorithms do not match."
+        )
+    if fingerprints.file_count != len(metadata.filepaths):
+        raise Step04Error(
+            "fingerprint file_count does not match metadata input files."
+        )
+    if comparison.expected_file_count != fingerprints.file_count:
+        raise Step04Error(
+            "comparison expected_file_count does not match fingerprints."
+        )
+    if comparison.current_file_count < comparison.unchanged_count:
+        raise Step04Error(
+            "comparison current_file_count is smaller than unchanged_count."
+        )
+    if (
+        comparison.unchanged_count
+        + comparison.changed_count
+        + comparison.missing_count
+        != comparison.expected_file_count
+    ):
+        raise Step04Error(
+            "comparison expected-file accounting is inconsistent."
+        )
+    if (
+        comparison.unchanged_count
+        + comparison.changed_count
+        + comparison.additional_count
+        != comparison.current_file_count
+    ):
+        raise Step04Error(
+            "comparison current-file accounting is inconsistent."
+        )
+
+    expected_indices = tuple(range(fingerprints.file_count))
+    fingerprint_indices = tuple(item.index for item in fingerprints.files)
+    if fingerprint_indices != expected_indices:
+        raise Step04Error(
+            "fingerprint indices are not contiguous and ordered."
+        )
+
+    metadata_paths = tuple(
+        _normalized_artifact_path(path) for path in metadata.filepaths
+    )
+    fingerprint_paths = tuple(
+        _normalized_artifact_path(item.path)
+        for item in fingerprints.files
+    )
+    if fingerprint_paths != metadata_paths:
+        raise Step04Error(
+            "fingerprint paths do not match metadata input-file order."
+        )
+
+    return RTSDictionaryArtifactValidation(
+        artifacts=artifacts,
+        fingerprints=fingerprints,
+        comparison=comparison,
+        fingerprint_json_path=_normalized_artifact_path(
+            resolved_fingerprint_path
+        ),
+        comparison_json_path=_normalized_artifact_path(
+            resolved_comparison_path
+        ),
+    )
 
 def _require_metadata_mapping(value, name: str) -> dict:
     if not isinstance(value, dict):
