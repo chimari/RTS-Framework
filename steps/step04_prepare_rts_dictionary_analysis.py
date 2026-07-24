@@ -1,6 +1,6 @@
 """Step 04: prepare an RTS dictionary analysis plan.
 
-Version 4.31.0 adds a high-level deterministic input-file audit workflow
+Version 4.32.0 adds deterministic audit-status evaluation for CLI and CI
 while preserving all existing public APIs.
 """
 
@@ -15,9 +15,10 @@ import json
 import os
 import tempfile
 
-__version__ = "4.31.0"
+__version__ = "4.32.0"
 
 from dataclasses import dataclass
+from enum import Enum
 
 import numpy as np
 
@@ -82,6 +83,9 @@ __all__ = [
     "load_rts_input_file_comparison_json",
     "RTSInputAuditResult",
     "audit_rts_dictionary_input_files",
+    "RTSAuditStatusName",
+    "RTSAuditStatus",
+    "evaluate_rts_input_audit",
     "build_rts_dictionary_artifacts",
     "build_rts_dictionary_csv",
     "build_rts_dictionary_csv_result",
@@ -2301,6 +2305,155 @@ def audit_rts_dictionary_input_files(
         fingerprints=fingerprints,
         comparison=comparison,
     )
+
+
+
+class RTSAuditStatusName(str, Enum):
+    """Stable symbolic names for Step 04 input-audit outcomes."""
+
+    MATCH = "MATCH"
+    ADDITIONAL_ONLY = "ADDITIONAL_ONLY"
+    CHANGED = "CHANGED"
+    MISSING = "MISSING"
+    CHANGED_AND_MISSING = "CHANGED_AND_MISSING"
+
+
+@dataclass(frozen=True, slots=True)
+class RTSAuditStatus:
+    """Deterministic policy result derived from one input audit."""
+
+    name: RTSAuditStatusName
+    exit_code: int
+    ok: bool
+    message: str
+    changed_count: int
+    missing_count: int
+    additional_count: int
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.name, RTSAuditStatusName):
+            raise Step04Error("name must be an RTSAuditStatusName.")
+        if isinstance(self.exit_code, bool) or not isinstance(
+            self.exit_code, int
+        ):
+            raise Step04Error("exit_code must be an integer.")
+        if self.exit_code < 0:
+            raise Step04Error("exit_code must be non-negative.")
+        if not isinstance(self.ok, bool):
+            raise Step04Error("ok must be a boolean.")
+        if not isinstance(self.message, str) or not self.message:
+            raise Step04Error("message must be a non-empty string.")
+
+        for field_name in (
+            "changed_count",
+            "missing_count",
+            "additional_count",
+        ):
+            value = getattr(self, field_name)
+            if isinstance(value, bool) or not isinstance(value, int):
+                raise Step04Error(f"{field_name} must be an integer.")
+            if value < 0:
+                raise Step04Error(f"{field_name} must be non-negative.")
+
+    def summary(self) -> dict:
+        """Return a deterministic JSON-compatible status summary."""
+        return {
+            "name": self.name.value,
+            "exit_code": self.exit_code,
+            "ok": self.ok,
+            "message": self.message,
+            "changed_count": self.changed_count,
+            "missing_count": self.missing_count,
+            "additional_count": self.additional_count,
+        }
+
+
+def _audit_count_phrase(count: int, singular: str) -> str:
+    suffix = "" if count == 1 else "s"
+    return f"{count} {singular}{suffix}"
+
+
+def evaluate_rts_input_audit(audit) -> RTSAuditStatus:
+    """Convert an audit or comparison result into a stable policy status."""
+    if isinstance(audit, RTSInputAuditResult):
+        comparison = audit.comparison
+    elif isinstance(audit, RTSInputFileFingerprintComparison):
+        comparison = audit
+    else:
+        raise Step04Error(
+            "audit must be an RTSInputAuditResult or "
+            "RTSInputFileFingerprintComparison."
+        )
+
+    changed_count = comparison.changed_count
+    missing_count = comparison.missing_count
+    additional_count = comparison.additional_count
+
+    if changed_count and missing_count:
+        name = RTSAuditStatusName.CHANGED_AND_MISSING
+        exit_code = 3
+        ok = False
+        message = (
+            "Input audit failed: "
+            f"{_audit_count_phrase(changed_count, 'file')} changed and "
+            f"{_audit_count_phrase(missing_count, 'file')} missing"
+        )
+        if additional_count:
+            message += (
+                f"; {_audit_count_phrase(additional_count, 'additional path')}"
+            )
+        message += "."
+    elif missing_count:
+        name = RTSAuditStatusName.MISSING
+        exit_code = 2
+        ok = False
+        message = (
+            "Input audit failed: "
+            f"{_audit_count_phrase(missing_count, 'file')} missing"
+        )
+        if additional_count:
+            message += (
+                f"; {_audit_count_phrase(additional_count, 'additional path')}"
+            )
+        message += "."
+    elif changed_count:
+        name = RTSAuditStatusName.CHANGED
+        exit_code = 1
+        ok = False
+        message = (
+            "Input audit failed: "
+            f"{_audit_count_phrase(changed_count, 'file')} changed"
+        )
+        if additional_count:
+            message += (
+                f"; {_audit_count_phrase(additional_count, 'additional path')}"
+            )
+        message += "."
+    elif additional_count:
+        name = RTSAuditStatusName.ADDITIONAL_ONLY
+        exit_code = 0
+        ok = True
+        message = (
+            "Input audit passed: all expected files match; "
+            f"{_audit_count_phrase(additional_count, 'additional path')} "
+            "reported."
+        )
+    else:
+        name = RTSAuditStatusName.MATCH
+        exit_code = 0
+        ok = True
+        message = "Input audit passed: all expected files match."
+
+    return RTSAuditStatus(
+        name=name,
+        exit_code=exit_code,
+        ok=ok,
+        message=message,
+        changed_count=changed_count,
+        missing_count=missing_count,
+        additional_count=additional_count,
+    )
+
 
 
 RTS_INPUT_COMPARISON_SCHEMA = (
