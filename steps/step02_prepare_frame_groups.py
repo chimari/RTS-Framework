@@ -7,13 +7,17 @@ No image pixels are read in this step.
 
 from __future__ import annotations
 
-__version__ = "2.0.0"
+__version__ = "2.1.0"
 
 import argparse
 from dataclasses import dataclass
 from pathlib import Path
 import sys
-from typing import Iterator, Sequence
+from typing import Callable, Iterator, Sequence
+
+import numpy as np
+
+from common.image_io import read_image
 
 from common.manifest import FrameManifest, FrameRecord, ManifestError
 
@@ -271,6 +275,96 @@ def _require_single_value(
         )
     return next(iter(values))
 
+
+
+ImageProgressCallback = Callable[[int, int, FrameRecord], None]
+
+
+def iter_dataset_images(
+    group: DatasetGroup,
+    *,
+    progress: ImageProgressCallback | None = None,
+) -> Iterator[tuple[FrameRecord, np.ndarray]]:
+    """Yield one image at a time for a dataset group.
+
+    Images are loaded lazily and are not retained by this function.  The caller
+    controls their lifetime by consuming each yielded array.
+
+    Parameters
+    ----------
+    group
+        Dataset group returned by :func:`prepare_frame_groups`.
+    progress
+        Optional callback called immediately before each image read as
+        ``progress(current, total, frame)``. ``current`` is one-based.
+
+    Yields
+    ------
+    tuple[FrameRecord, numpy.ndarray]
+        The frame record and its two-dimensional image array.
+
+    Raises
+    ------
+    Step02Error
+        If an image cannot be read or if its shape or dtype no longer matches
+        the validated dataset metadata.
+    """
+    total = group.n_frames
+
+    for current, frame in enumerate(group.frames, start=1):
+        if progress is not None:
+            progress(current, total, frame)
+
+        try:
+            image = read_image(frame.filepath)
+        except Exception as exc:
+            raise Step02Error(
+                "Unable to read dataset image: "
+                f"dataset={group.name!r}, "
+                f"frame_index={frame.frame_index}, "
+                f"filepath={frame.filepath}: {exc}"
+            ) from exc
+
+        _validate_loaded_image(group, frame, image)
+        yield frame, image
+
+
+def _validate_loaded_image(
+    group: DatasetGroup,
+    frame: FrameRecord,
+    image: np.ndarray,
+) -> None:
+    if image.ndim != 2:
+        raise Step02Error(
+            "Loaded image is not two-dimensional: "
+            f"dataset={group.name!r}, "
+            f"frame_index={frame.frame_index}, "
+            f"filepath={frame.filepath}, "
+            f"ndim={image.ndim}."
+        )
+
+    actual_shape = tuple(int(value) for value in image.shape)
+    if actual_shape != group.image_shape:
+        raise Step02Error(
+            "Loaded image shape does not match dataset metadata: "
+            f"dataset={group.name!r}, "
+            f"frame_index={frame.frame_index}, "
+            f"filepath={frame.filepath}, "
+            f"expected={group.image_shape}, "
+            f"actual={actual_shape}."
+        )
+
+    expected_dtype = np.dtype(group.pixel_dtype)
+    actual_dtype = image.dtype
+    if actual_dtype != expected_dtype:
+        raise Step02Error(
+            "Loaded image dtype does not match dataset metadata: "
+            f"dataset={group.name!r}, "
+            f"frame_index={frame.frame_index}, "
+            f"filepath={frame.filepath}, "
+            f"expected={expected_dtype}, "
+            f"actual={actual_dtype}."
+        )
 
 def build_argument_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
