@@ -1,13 +1,12 @@
 """Step 04: prepare an RTS dictionary analysis plan.
 
-Version 4.1.0 adds deterministic loading of one selected pixel time series.
-It reuses the Step 03 lazy frame iterator, reads each frame once, and never
-constructs a full image cube.
+Version 4.2.0 adds deterministic basic statistics for one pixel time series.
+The statistics are algorithm-neutral and do not perform RTS classification.
 """
 
 from __future__ import annotations
 
-__version__ = "4.1.0"
+__version__ = "4.2.0"
 
 from dataclasses import dataclass
 
@@ -22,8 +21,10 @@ from steps.step03_prepare_bias_analysis import (
 
 __all__ = [
     "PixelTimeSeries",
+    "PixelTimeSeriesStatistics",
     "RTSDictionaryPlan",
     "Step04Error",
+    "compute_pixel_timeseries_statistics",
     "load_pixel_timeseries",
     "prepare_rts_dictionary_analysis",
 ]
@@ -32,6 +33,38 @@ __all__ = [
 class Step04Error(Exception):
     """Raised when Step 04 cannot prepare an RTS dictionary analysis."""
 
+
+
+
+@dataclass(slots=True, frozen=True)
+class PixelTimeSeriesStatistics:
+    """Immutable algorithm-neutral statistics for one pixel time series."""
+
+    series: "PixelTimeSeries"
+    n_frames: int
+    minimum: float
+    maximum: float
+    mean: float
+    median: float
+    standard_deviation: float
+    median_absolute_deviation: float
+    peak_to_peak: float
+
+    def summary(self) -> dict[str, object]:
+        """Return a canonical JSON-serializable statistics summary."""
+        return {
+            "dataset": self.series.dataset,
+            "row": self.series.row,
+            "column": self.series.column,
+            "n_frames": self.n_frames,
+            "minimum": self.minimum,
+            "maximum": self.maximum,
+            "mean": self.mean,
+            "median": self.median,
+            "standard_deviation": self.standard_deviation,
+            "median_absolute_deviation": self.median_absolute_deviation,
+            "peak_to_peak": self.peak_to_peak,
+        }
 
 
 @dataclass(slots=True, frozen=True)
@@ -82,6 +115,79 @@ class RTSDictionaryPlan:
         )
 
 
+
+
+def compute_pixel_timeseries_statistics(
+    series: PixelTimeSeries,
+) -> PixelTimeSeriesStatistics:
+    """Compute deterministic basic statistics for one pixel time series.
+
+    Definitions
+    -----------
+    ``standard_deviation``
+        Population standard deviation, equivalent to ``numpy.std(ddof=0)``.
+    ``median_absolute_deviation``
+        Raw, unscaled median of ``abs(values - median(values))``.
+    ``peak_to_peak``
+        ``maximum - minimum``.
+
+    This function does not estimate RTS states, select thresholds, remove
+    outliers, or apply Gaussian-equivalent scaling to the MAD.
+
+    Parameters
+    ----------
+    series
+        Pixel time series returned by :func:`load_pixel_timeseries`.
+
+    Returns
+    -------
+    PixelTimeSeriesStatistics
+        Immutable scalar statistics retaining the source series.
+
+    Raises
+    ------
+    Step04Error
+        If ``series`` is invalid or its values are empty or non-finite.
+    """
+    if not isinstance(series, PixelTimeSeries):
+        raise Step04Error(
+            "series must be a PixelTimeSeries returned by "
+            "load_pixel_timeseries()."
+        )
+
+    values = series.values
+    if values.ndim != 1:
+        raise Step04Error("Pixel time-series values must be one-dimensional.")
+    if values.size == 0:
+        raise Step04Error("Pixel time-series values must not be empty.")
+    if values.size != series.n_frames:
+        raise Step04Error(
+            f"Pixel time series contains {values.size} value(s); "
+            f"metadata requires {series.n_frames}."
+        )
+    if not np.all(np.isfinite(values)):
+        raise Step04Error("Pixel time-series values must all be finite.")
+
+    minimum = float(np.min(values))
+    maximum = float(np.max(values))
+    mean = float(np.mean(values, dtype=np.float64))
+    median = float(np.median(values))
+    standard_deviation = float(np.std(values, ddof=0, dtype=np.float64))
+    median_absolute_deviation = float(
+        np.median(np.abs(values - median))
+    )
+
+    return PixelTimeSeriesStatistics(
+        series=series,
+        n_frames=series.n_frames,
+        minimum=minimum,
+        maximum=maximum,
+        mean=mean,
+        median=median,
+        standard_deviation=standard_deviation,
+        median_absolute_deviation=median_absolute_deviation,
+        peak_to_peak=maximum - minimum,
+    )
 
 def load_pixel_timeseries(
     plan: RTSDictionaryPlan,
