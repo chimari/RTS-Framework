@@ -1,7 +1,7 @@
 """Step 04: prepare an RTS dictionary analysis plan.
 
-Version 4.29.0 adds deterministic comparison of saved fingerprints with
-current input files while preserving all existing public APIs.
+Version 4.30.0 adds deterministic atomic JSON persistence and validated
+loading for input-file comparison reports while preserving existing APIs.
 """
 
 from __future__ import annotations
@@ -15,7 +15,7 @@ import json
 import os
 import tempfile
 
-__version__ = "4.29.0"
+__version__ = "4.30.0"
 
 from dataclasses import dataclass
 
@@ -78,6 +78,8 @@ __all__ = [
     "write_rts_input_file_fingerprints_json",
     "load_rts_input_file_fingerprints_json",
     "compare_rts_input_file_fingerprints",
+    "write_rts_input_file_comparison_json",
+    "load_rts_input_file_comparison_json",
     "build_rts_dictionary_artifacts",
     "build_rts_dictionary_csv",
     "build_rts_dictionary_csv_result",
@@ -2155,6 +2157,303 @@ def compare_rts_input_file_fingerprints(
         changes=tuple(changes),
         additional_paths=additional_paths,
     )
+
+
+
+
+RTS_INPUT_COMPARISON_SCHEMA = (
+    "rts-framework.step04.input-file-fingerprint-comparison"
+)
+RTS_INPUT_COMPARISON_SCHEMA_VERSION = 1
+
+
+def _default_comparison_json_path(metadata_path: Path) -> Path:
+    """Return the canonical comparison-report sidecar path."""
+    return Path(str(metadata_path) + ".fingerprint-comparison.json")
+
+
+def write_rts_input_file_comparison_json(
+    comparison,
+    output_path=None,
+) -> Path:
+    """Write one input-file comparison report as deterministic atomic JSON."""
+    if not isinstance(comparison, RTSInputFileFingerprintComparison):
+        raise Step04Error(
+            "comparison must be an RTSInputFileFingerprintComparison."
+        )
+
+    if output_path is None:
+        destination = _default_comparison_json_path(
+            comparison.metadata_path
+        )
+    else:
+        try:
+            destination = Path(output_path)
+        except TypeError as exc:
+            raise Step04Error("output_path must be path-like or None.") from exc
+
+    document = {
+        "schema": RTS_INPUT_COMPARISON_SCHEMA,
+        "schema_version": RTS_INPUT_COMPARISON_SCHEMA_VERSION,
+        "step04_version": __version__,
+        **comparison.summary(),
+    }
+
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    temporary = destination.with_name(destination.name + ".tmp")
+    try:
+        with temporary.open("w", encoding="utf-8", newline="\n") as stream:
+            json.dump(
+                document,
+                stream,
+                ensure_ascii=False,
+                indent=2,
+                sort_keys=True,
+            )
+            stream.write("\n")
+        os.replace(temporary, destination)
+    except OSError as exc:
+        try:
+            temporary.unlink(missing_ok=True)
+        except OSError:
+            pass
+        raise Step04Error(
+            f"Could not write input comparison JSON '{destination}': {exc}"
+        ) from exc
+
+    return destination
+
+
+def load_rts_input_file_comparison_json(
+    path,
+) -> RTSInputFileFingerprintComparison:
+    """Load and validate one Step 04 input-file comparison JSON report."""
+    try:
+        source = Path(path)
+    except TypeError as exc:
+        raise Step04Error("path must be path-like.") from exc
+    if not source.is_file():
+        raise Step04Error(
+            f"input comparison JSON does not exist: {source}"
+        )
+
+    try:
+        with source.open("r", encoding="utf-8") as stream:
+            document = json.load(stream)
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        raise Step04Error(
+            f"Could not read input comparison JSON '{source}': {exc}"
+        ) from exc
+
+    root = _require_fingerprint_mapping(document, "document")
+    schema = _require_fingerprint_string(root.get("schema"), "schema")
+    if schema != RTS_INPUT_COMPARISON_SCHEMA:
+        raise Step04Error("unsupported input comparison schema.")
+
+    schema_version = _require_fingerprint_int(
+        root.get("schema_version"), "schema_version", minimum=1
+    )
+    if schema_version != RTS_INPUT_COMPARISON_SCHEMA_VERSION:
+        raise Step04Error("unsupported input comparison schema_version.")
+
+    _require_fingerprint_string(
+        root.get("step04_version"), "step04_version"
+    )
+    metadata_path = Path(
+        _require_fingerprint_string(
+            root.get("metadata_path"), "metadata_path"
+        )
+    )
+    algorithm = _require_fingerprint_string(
+        root.get("algorithm"), "algorithm"
+    )
+    if algorithm != "sha256":
+        raise Step04Error("algorithm must be sha256.")
+
+    expected_file_count = _require_fingerprint_int(
+        root.get("expected_file_count"), "expected_file_count"
+    )
+    current_file_count = _require_fingerprint_int(
+        root.get("current_file_count"), "current_file_count"
+    )
+    unchanged_count = _require_fingerprint_int(
+        root.get("unchanged_count"), "unchanged_count"
+    )
+    changed_count = _require_fingerprint_int(
+        root.get("changed_count"), "changed_count"
+    )
+    missing_count = _require_fingerprint_int(
+        root.get("missing_count"), "missing_count"
+    )
+    additional_count = _require_fingerprint_int(
+        root.get("additional_count"), "additional_count"
+    )
+
+    matches = root.get("matches")
+    if not isinstance(matches, bool):
+        raise Step04Error("matches must be a boolean.")
+
+    unchanged_value = root.get("unchanged_indices")
+    if not isinstance(unchanged_value, list):
+        raise Step04Error("unchanged_indices must be a JSON array.")
+    unchanged_indices = tuple(
+        _require_fingerprint_int(
+            value, f"unchanged_indices[{index}]"
+        )
+        for index, value in enumerate(unchanged_value)
+    )
+    if tuple(sorted(set(unchanged_indices))) != unchanged_indices:
+        raise Step04Error(
+            "unchanged_indices must be unique and strictly increasing."
+        )
+    if any(index >= expected_file_count for index in unchanged_indices):
+        raise Step04Error(
+            "unchanged_indices must be less than expected_file_count."
+        )
+
+    changes_value = root.get("changes")
+    if not isinstance(changes_value, list):
+        raise Step04Error("changes must be a JSON array.")
+
+    changes: list[RTSInputFileFingerprintChange] = []
+    seen_change_indices: set[int] = set()
+    for position, value in enumerate(changes_value):
+        item = _require_fingerprint_mapping(
+            value, f"changes[{position}]"
+        )
+        index = _require_fingerprint_int(
+            item.get("index"), f"changes[{position}].index"
+        )
+        if index >= expected_file_count:
+            raise Step04Error(
+                f"changes[{position}].index must be less than "
+                "expected_file_count."
+            )
+        if index in seen_change_indices:
+            raise Step04Error("change indices must be unique.")
+        seen_change_indices.add(index)
+
+        path_value = _require_fingerprint_string(
+            item.get("path"), f"changes[{position}].path"
+        )
+        expected_size = _require_fingerprint_int(
+            item.get("expected_size_bytes"),
+            f"changes[{position}].expected_size_bytes",
+        )
+        expected_sha256 = _require_fingerprint_string(
+            item.get("expected_sha256"),
+            f"changes[{position}].expected_sha256",
+        )
+        if len(expected_sha256) != 64 or any(
+            character not in "0123456789abcdef"
+            for character in expected_sha256
+        ):
+            raise Step04Error(
+                f"changes[{position}].expected_sha256 must be 64 "
+                "lowercase hexadecimal characters."
+            )
+
+        status = _require_fingerprint_string(
+            item.get("status"), f"changes[{position}].status"
+        )
+        if status not in {"changed", "missing"}:
+            raise Step04Error(
+                f"changes[{position}].status must be changed or missing."
+            )
+
+        current_size = item.get("current_size_bytes")
+        current_sha256 = item.get("current_sha256")
+        if status == "missing":
+            if current_size is not None or current_sha256 is not None:
+                raise Step04Error(
+                    "missing changes must have null current values."
+                )
+        else:
+            current_size = _require_fingerprint_int(
+                current_size,
+                f"changes[{position}].current_size_bytes",
+            )
+            current_sha256 = _require_fingerprint_string(
+                current_sha256,
+                f"changes[{position}].current_sha256",
+            )
+            if len(current_sha256) != 64 or any(
+                character not in "0123456789abcdef"
+                for character in current_sha256
+            ):
+                raise Step04Error(
+                    f"changes[{position}].current_sha256 must be 64 "
+                    "lowercase hexadecimal characters."
+                )
+
+        changes.append(
+            RTSInputFileFingerprintChange(
+                index=index,
+                path=_normalized_artifact_path(Path(path_value)),
+                expected_size_bytes=expected_size,
+                current_size_bytes=current_size,
+                expected_sha256=expected_sha256,
+                current_sha256=current_sha256,
+                status=status,
+            )
+        )
+
+    if tuple(change.index for change in changes) != tuple(
+        sorted(change.index for change in changes)
+    ):
+        raise Step04Error(
+            "changes must be ordered by ascending index."
+        )
+
+    additional_value = root.get("additional_paths")
+    if not isinstance(additional_value, list):
+        raise Step04Error("additional_paths must be a JSON array.")
+    additional_paths = tuple(
+        _normalized_artifact_path(
+            Path(
+                _require_fingerprint_string(
+                    value, f"additional_paths[{index}]"
+                )
+            )
+        )
+        for index, value in enumerate(additional_value)
+    )
+    if len(set(additional_paths)) != len(additional_paths):
+        raise Step04Error("additional_paths must be unique.")
+
+    result = RTSInputFileFingerprintComparison(
+        metadata_path=metadata_path,
+        algorithm=algorithm,
+        expected_file_count=expected_file_count,
+        current_file_count=current_file_count,
+        unchanged_indices=unchanged_indices,
+        changes=tuple(changes),
+        additional_paths=additional_paths,
+    )
+
+    if result.unchanged_count != unchanged_count:
+        raise Step04Error("unchanged_count does not match unchanged_indices.")
+    if result.changed_count != changed_count:
+        raise Step04Error("changed_count does not match changes.")
+    if result.missing_count != missing_count:
+        raise Step04Error("missing_count does not match changes.")
+    if result.additional_count != additional_count:
+        raise Step04Error(
+            "additional_count does not match additional_paths."
+        )
+    if result.matches != matches:
+        raise Step04Error("matches is inconsistent with comparison contents.")
+    if (
+        result.unchanged_count
+        + result.changed_count
+        + result.missing_count
+        != expected_file_count
+    ):
+        raise Step04Error(
+            "expected file classifications must sum to expected_file_count."
+        )
+
+    return result
 
 
 
