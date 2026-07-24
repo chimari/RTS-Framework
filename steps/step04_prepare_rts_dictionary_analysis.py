@@ -1,7 +1,7 @@
 """Step 04: prepare an RTS dictionary analysis plan.
 
-Version 4.20.0 adds immutable structured cancellation information while
-preserving cooperative cancellation and existing analysis behavior.
+Version 4.21.0 adds immutable dictionary-build parameters to structured
+build results while preserving CSV output and existing public APIs.
 """
 
 from __future__ import annotations
@@ -13,7 +13,7 @@ import csv
 import os
 import tempfile
 
-__version__ = "4.20.0"
+__version__ = "4.21.0"
 
 from dataclasses import dataclass
 
@@ -33,6 +33,7 @@ __all__ = [
     "RTSDictionaryBuildResult",
     "RTSProgressState",
     "RTSCancellationInfo",
+    "RTSDictionaryBuildParameters",
     "Step04Cancelled",
     "RTSDictionaryPlan",
     "RTSPixelAnalysisResult",
@@ -436,6 +437,52 @@ class RTSProgressState:
         }
 
 
+
+@dataclass(slots=True, frozen=True)
+class RTSDictionaryBuildParameters:
+    """Immutable normalized parameters for one dictionary build."""
+
+    minimum_score: float
+    minimum_state_count: int
+    minimum_separation: float
+    minimum_transition_count: int
+    minimum_lower_run: int
+    minimum_upper_run: int
+    row_start: int
+    row_stop: int
+    column_start: int
+    column_stop: int
+
+    @property
+    def row_count(self) -> int:
+        return self.row_stop - self.row_start
+
+    @property
+    def column_count(self) -> int:
+        return self.column_stop - self.column_start
+
+    @property
+    def pixel_count(self) -> int:
+        return self.row_count * self.column_count
+
+    def summary(self) -> dict[str, object]:
+        return {
+            "minimum_score": float(self.minimum_score),
+            "minimum_state_count": self.minimum_state_count,
+            "minimum_separation": float(self.minimum_separation),
+            "minimum_transition_count": self.minimum_transition_count,
+            "minimum_lower_run": self.minimum_lower_run,
+            "minimum_upper_run": self.minimum_upper_run,
+            "row_start": self.row_start,
+            "row_stop": self.row_stop,
+            "column_start": self.column_start,
+            "column_stop": self.column_stop,
+            "row_count": self.row_count,
+            "column_count": self.column_count,
+            "pixel_count": self.pixel_count,
+        }
+
+
 @dataclass(slots=True, frozen=True)
 class RTSDictionaryBuildResult:
     """Immutable summary of one completed RTS dictionary CSV build."""
@@ -448,6 +495,7 @@ class RTSDictionaryBuildResult:
     column_stop: int
     analyzed_pixel_count: int
     candidate_count: int
+    parameters: RTSDictionaryBuildParameters
 
     @property
     def region_shape(self) -> tuple[int, int]:
@@ -469,6 +517,7 @@ class RTSDictionaryBuildResult:
             "region_shape": self.region_shape,
             "analyzed_pixel_count": self.analyzed_pixel_count,
             "candidate_count": self.candidate_count,
+            "parameters": self.parameters.summary(),
         }
 
 
@@ -820,10 +869,19 @@ def build_rts_dictionary_csv_result(
     except TypeError as exc:
         raise Step04Error("output_path must be path-like.") from exc
 
-    total_pixel_count = (
-        (resolved_row_stop - resolved_row_start)
-        * (resolved_column_stop - resolved_column_start)
+    parameters = RTSDictionaryBuildParameters(
+        minimum_score=float(minimum_score),
+        minimum_state_count=int(minimum_state_count),
+        minimum_separation=float(minimum_separation),
+        minimum_transition_count=int(minimum_transition_count),
+        minimum_lower_run=int(minimum_lower_run),
+        minimum_upper_run=int(minimum_upper_run),
+        row_start=int(resolved_row_start),
+        row_stop=int(resolved_row_stop),
+        column_start=int(resolved_column_start),
+        column_stop=int(resolved_column_stop),
     )
+    total_pixel_count = parameters.pixel_count
 
     def check_cancellation(completed: int) -> None:
         if cancel_requested is None:
@@ -908,6 +966,7 @@ def build_rts_dictionary_csv_result(
         column_stop=int(resolved_column_stop),
         analyzed_pixel_count=analyzed_pixel_count,
         candidate_count=candidate_count,
+        parameters=parameters,
     )
 
 def write_rts_dictionary_csv(path, candidates) -> Path:
