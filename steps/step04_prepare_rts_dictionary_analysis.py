@@ -1,28 +1,59 @@
 """Step 04: prepare an RTS dictionary analysis plan.
 
-Version 4.0.0 introduces the metadata-only planning boundary for RTS dictionary
-generation. It validates a completed Step 03 bias-analysis plan and does not
-read image pixels or choose an RTS detection algorithm.
+Version 4.1.0 adds deterministic loading of one selected pixel time series.
+It reuses the Step 03 lazy frame iterator, reads each frame once, and never
+constructs a full image cube.
 """
 
 from __future__ import annotations
 
-__version__ = "4.0.0"
+__version__ = "4.1.0"
 
 from dataclasses import dataclass
 
-from steps.step03_prepare_bias_analysis import BiasAnalysisPlan
+import numpy as np
+
+from steps.step03_prepare_bias_analysis import (
+    BiasAnalysisPlan,
+    Step03Error,
+    iter_bias_frames,
+)
 
 
 __all__ = [
+    "PixelTimeSeries",
     "RTSDictionaryPlan",
     "Step04Error",
+    "load_pixel_timeseries",
     "prepare_rts_dictionary_analysis",
 ]
 
 
 class Step04Error(Exception):
     """Raised when Step 04 cannot prepare an RTS dictionary analysis."""
+
+
+
+@dataclass(slots=True, frozen=True)
+class PixelTimeSeries:
+    """Immutable time series for one image coordinate."""
+
+    plan: "RTSDictionaryPlan"
+    dataset: str
+    row: int
+    column: int
+    n_frames: int
+    values: np.ndarray
+
+    def summary(self) -> dict[str, object]:
+        """Return a canonical JSON-serializable metadata summary."""
+        return {
+            "dataset": self.dataset,
+            "row": self.row,
+            "column": self.column,
+            "n_frames": self.n_frames,
+            "dtype": self.values.dtype.name,
+        }
 
 
 @dataclass(slots=True, frozen=True)
@@ -50,6 +81,105 @@ class RTSDictionaryPlan:
             ]
         )
 
+
+
+def load_pixel_timeseries(
+    plan: RTSDictionaryPlan,
+    row: int,
+    column: int,
+) -> PixelTimeSeries:
+    """Load one pixel value from every bias frame in canonical order.
+
+    The function reads frames lazily through :func:`iter_bias_frames`, retains
+    only a one-dimensional float64 result array, and does not construct a full
+    ``(frames, height, width)`` image cube.
+
+    Parameters
+    ----------
+    plan
+        RTS dictionary plan returned by
+        :func:`prepare_rts_dictionary_analysis`.
+    row, column
+        Zero-based image coordinates.
+
+    Returns
+    -------
+    PixelTimeSeries
+        Immutable metadata plus a read-only, C-contiguous float64 vector.
+
+    Raises
+    ------
+    Step04Error
+        If the plan or coordinates are invalid, Step 03 cannot read a frame,
+        or the iterator yields an unexpected frame count.
+    """
+    if not isinstance(plan, RTSDictionaryPlan):
+        raise Step04Error(
+            "plan must be an RTSDictionaryPlan returned by "
+            "prepare_rts_dictionary_analysis()."
+        )
+
+    validated_row = _validate_coordinate("row", row, plan.image_shape[0])
+    validated_column = _validate_coordinate(
+        "column",
+        column,
+        plan.image_shape[1],
+    )
+
+    values = np.empty(plan.n_frames, dtype=np.float64)
+    count = 0
+
+    try:
+        for image in iter_bias_frames(plan.bias_plan):
+            if count >= plan.n_frames:
+                raise Step04Error(
+                    f"Dataset {plan.dataset!r} yielded more than "
+                    f"{plan.n_frames} frame(s)."
+                )
+            if image.shape != plan.image_shape:
+                raise Step04Error(
+                    f"Bias frame {count} has shape {image.shape!r}; "
+                    f"expected {plan.image_shape!r}."
+                )
+            values[count] = image[validated_row, validated_column]
+            count += 1
+    except Step03Error as exc:
+        raise Step04Error(
+            f"Could not load pixel time series for dataset "
+            f"{plan.dataset!r}: {exc}"
+        ) from exc
+
+    if count == 0:
+        raise Step04Error(
+            f"Dataset {plan.dataset!r} yielded no frames."
+        )
+    if count != plan.n_frames:
+        raise Step04Error(
+            f"Dataset {plan.dataset!r} yielded {count} frame(s); "
+            f"the RTS dictionary plan requires {plan.n_frames}."
+        )
+
+    values.setflags(write=False)
+
+    return PixelTimeSeries(
+        plan=plan,
+        dataset=plan.dataset,
+        row=validated_row,
+        column=validated_column,
+        n_frames=count,
+        values=values,
+    )
+
+
+def _validate_coordinate(name: str, value: int, limit: int) -> int:
+    """Validate one zero-based image coordinate."""
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise Step04Error(f"{name} must be an integer.")
+    if value < 0 or value >= limit:
+        raise Step04Error(
+            f"{name}={value} is outside the valid range 0..{limit - 1}."
+        )
+    return value
 
 def prepare_rts_dictionary_analysis(
     bias_plan: BiasAnalysisPlan,
