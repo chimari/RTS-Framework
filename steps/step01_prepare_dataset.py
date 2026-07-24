@@ -7,12 +7,14 @@ immutable result object.  No RTS detection or image statistics are performed.
 
 from __future__ import annotations
 
-__version__ = "1.2.0"
+__version__ = "1.3.0"
 
+import argparse
 from dataclasses import dataclass
 import json
 from pathlib import Path
-from typing import Callable, Literal
+import sys
+from typing import Callable, Literal, Sequence
 
 from common.image_io import ImageIOError, get_image_shape, validate_image
 from common.manifest import FrameManifest, FrameRecord, ManifestError, ManifestValidation
@@ -280,3 +282,120 @@ def _validate_shape(frame: FrameRecord) -> None:
             f"path={frame.filepath}, expected={expected_shape}, "
             f"actual={actual_shape}"
         )
+
+def build_argument_parser() -> argparse.ArgumentParser:
+    """Build the Step 01 command-line argument parser."""
+    parser = argparse.ArgumentParser(
+        prog="python -m steps.step01_prepare_dataset",
+        description=(
+            "Load an RTS Framework manifest and validate all referenced images."
+        ),
+    )
+    parser.add_argument(
+        "manifest",
+        type=Path,
+        help="CSV manifest to validate.",
+    )
+    parser.add_argument(
+        "--frame-root",
+        type=Path,
+        default=None,
+        help="Root directory used to resolve relative frame paths.",
+    )
+    parser.add_argument(
+        "--validation-mode",
+        choices=("shape", "full"),
+        default="shape",
+        help=(
+            "Image validation level: shape reads metadata only; "
+            "full also reads pixel arrays and checks dtype."
+        ),
+    )
+    parser.add_argument(
+        "--report",
+        type=Path,
+        default=None,
+        help="Optional destination for the machine-readable JSON report.",
+    )
+    parser.add_argument(
+        "--quiet",
+        action="store_true",
+        help="Suppress per-frame progress messages.",
+    )
+    parser.add_argument(
+        "--max-issues",
+        type=int,
+        default=20,
+        help=(
+            "Maximum issues printed in the text summary. "
+            "Use -1 to print all issues."
+        ),
+    )
+    parser.add_argument(
+        "--version",
+        action="version",
+        version=f"%(prog)s {__version__}",
+    )
+    return parser
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    """Run Step 01 from the command line.
+
+    Exit codes
+    ----------
+    0
+        Manifest and all images passed validation.
+    1
+        Validation completed but one or more issues were found.
+    2
+        The command could not run, such as an unreadable manifest or report
+        write failure. ``argparse`` also uses exit code 2 for invalid options.
+    """
+    parser = build_argument_parser()
+    args = parser.parse_args(argv)
+
+    if args.max_issues < -1:
+        parser.error("--max-issues must be -1 or zero or greater")
+
+    progress: ProgressCallback | None = None
+    if not args.quiet:
+        def show_progress(
+            current: int,
+            total: int,
+            frame: FrameRecord,
+        ) -> None:
+            print(
+                f"Checking image {current}/{total}: "
+                f"{frame.dataset} / {frame.filename}"
+            )
+
+        progress = show_progress
+
+    try:
+        result = prepare_dataset(
+            args.manifest,
+            frame_root=args.frame_root,
+            validation_mode=args.validation_mode,
+            progress=progress,
+        )
+
+        if args.report is not None:
+            report_path = write_report(result, args.report)
+            print(f"JSON report: {report_path}")
+
+    except Step01Error as exc:
+        print(f"Step 01 error: {exc}", file=sys.stderr)
+        return 2
+
+    if not args.quiet:
+        print()
+
+    max_issues = None if args.max_issues == -1 else args.max_issues
+    print(result.summary(max_issues=max_issues))
+    return 0 if result.valid else 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
+
