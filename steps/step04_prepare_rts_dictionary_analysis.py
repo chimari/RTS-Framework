@@ -1,12 +1,12 @@
 """Step 04: prepare an RTS dictionary analysis plan.
 
-Version 4.9.0 adds deterministic lazy row-major coordinate generation for
-a validated full image or rectangular region of interest.
+Version 4.10.0 adds a thin lazy image/ROI analysis iterator that composes
+row-major coordinate generation with explicit-coordinate pixel analysis.
 """
 
 from __future__ import annotations
 
-__version__ = "4.9.0"
+__version__ = "4.10.0"
 
 from dataclasses import dataclass
 
@@ -36,6 +36,7 @@ __all__ = [
     "compute_pixel_timeseries_statistics",
     "compute_two_state_score",
     "iter_image_coordinates",
+    "iter_image_rts_analyses",
     "iter_rts_pixel_analyses",
     "load_pixel_timeseries",
     "prepare_rts_dictionary_analysis",
@@ -415,6 +416,69 @@ def iter_image_coordinates(
     for row in range(row_start, row_stop):
         for column in range(column_start, column_stop):
             yield (row, column)
+
+
+def iter_image_rts_analyses(
+    plan: RTSDictionaryPlan,
+    *,
+    row_start: int = 0,
+    row_stop: int | None = None,
+    column_start: int = 0,
+    column_stop: int | None = None,
+    minimum_score: float,
+    minimum_state_count: int,
+    minimum_separation: float,
+    minimum_transition_count: int,
+    minimum_lower_run: int,
+    minimum_upper_run: int,
+):
+    """Yield RTS analyses for a full image or rectangular ROI in row-major order.
+
+    This function is a thin lazy composition of
+    :func:`iter_image_coordinates` and :func:`iter_rts_pixel_analyses`.
+    It adds no new analysis, candidate, transition, caching, parallelization,
+    progress-reporting, or serialization behavior.
+
+    Parameters
+    ----------
+    plan
+        Plan returned by :func:`prepare_rts_dictionary_analysis`.
+    row_start, row_stop, column_start, column_stop
+        ROI bounds forwarded unchanged to :func:`iter_image_coordinates`.
+        Stop bounds are exclusive and ``None`` means the image edge.
+    minimum_score, minimum_state_count, minimum_separation
+        Base-candidate thresholds forwarded unchanged.
+    minimum_transition_count, minimum_lower_run, minimum_upper_run
+        Temporal-candidate thresholds forwarded unchanged.
+
+    Yields
+    ------
+    RTSPixelAnalysisResult
+        One result per coordinate in deterministic row-major order.
+
+    Raises
+    ------
+    Step04Error
+        Propagated unchanged and lazily from coordinate generation or one-pixel
+        analysis.
+    """
+    coordinates = iter_image_coordinates(
+        plan,
+        row_start=row_start,
+        row_stop=row_stop,
+        column_start=column_start,
+        column_stop=column_stop,
+    )
+    yield from iter_rts_pixel_analyses(
+        plan,
+        coordinates,
+        minimum_score=minimum_score,
+        minimum_state_count=minimum_state_count,
+        minimum_separation=minimum_separation,
+        minimum_transition_count=minimum_transition_count,
+        minimum_lower_run=minimum_lower_run,
+        minimum_upper_run=minimum_upper_run,
+    )
 
 def iter_rts_pixel_analyses(
     plan: RTSDictionaryPlan,
