@@ -7,12 +7,15 @@ No image pixels are read in this step.
 
 from __future__ import annotations
 
-__version__ = "2.3.0"
+__version__ = "2.4.0"
 
 import argparse
 import csv
 from dataclasses import dataclass
 from pathlib import Path
+import os
+import re
+import tempfile
 import sys
 from typing import Callable, Iterator, Sequence
 
@@ -536,9 +539,19 @@ def write_statistics_csv(
         key=lambda frame: (frame.frame_index, str(frame.filepath)),
     )
 
+    temporary_path: Path | None = None
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
-        with path.open("w", encoding="utf-8", newline="") as stream:
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            newline="",
+            dir=path.parent,
+            prefix=f".{path.name}.",
+            suffix=".tmp",
+            delete=False,
+        ) as stream:
+            temporary_path = Path(stream.name)
             writer = csv.DictWriter(
                 stream,
                 fieldnames=STATISTICS_CSV_COLUMNS,
@@ -562,7 +575,17 @@ def write_statistics_csv(
                         "stddev": _format_float(frame.stddev),
                     }
                 )
+            stream.flush()
+            os.fsync(stream.fileno())
+
+        temporary_path.replace(path)
+        temporary_path = None
     except (OSError, csv.Error, TypeError, ValueError) as exc:
+        if temporary_path is not None:
+            try:
+                temporary_path.unlink(missing_ok=True)
+            except OSError:
+                pass
         raise Step02Error(
             f"Unable to write Step 02 statistics CSV: {path}: {exc}"
         ) from exc
@@ -574,6 +597,76 @@ def _format_float(value: float) -> str:
     """Return a stable round-trippable decimal representation."""
     return format(float(value), ".17g")
 
+def statistics_filename(dataset: str) -> str:
+    """Return a deterministic filesystem-safe CSV filename for a dataset."""
+    stem = re.sub(r"[^A-Za-z0-9._-]+", "_", dataset.strip())
+    stem = stem.strip("._-")
+    if not stem:
+        stem = "dataset"
+    return f"{stem}.csv"
+
+
+def write_all_statistics_csv(
+    result: Step02Result,
+    output_dir: str | Path,
+    *,
+    quiet: bool = False,
+) -> tuple[Path, ...]:
+    """Compute and write one statistics CSV per dataset.
+
+    All image statistics are computed before any output file is written. This
+    prevents read or validation failures from leaving a partially generated
+    output set.
+    """
+    directory = Path(output_dir)
+    statistics_results: list[DatasetStatistics] = []
+    filenames: dict[str, str] = {}
+
+    for group_index, group in enumerate(result.groups, start=1):
+        filename = statistics_filename(group.name)
+        previous = filenames.get(filename)
+        if previous is not None and previous != group.name:
+            raise Step02Error(
+                "Dataset names map to the same statistics filename: "
+                f"{previous!r} and {group.name!r} -> {filename!r}."
+            )
+        filenames[filename] = group.name
+
+        if not quiet:
+            print(
+                f"[{group_index}/{result.n_datasets}] "
+                f"{group.name}: {group.n_frames} frames"
+            )
+
+        def progress(
+            current: int,
+            total: int,
+            frame: FrameRecord,
+        ) -> None:
+            if not quiet:
+                print(
+                    f"  frame {current}/{total}: {frame.filepath.name}",
+                    flush=True,
+                )
+
+        statistics_results.append(
+            compute_dataset_statistics(
+                group,
+                progress=progress,
+            )
+        )
+
+    written: list[Path] = []
+    for statistics in statistics_results:
+        path = directory / statistics_filename(statistics.dataset)
+        write_statistics_csv(statistics, path)
+        written.append(path)
+        if not quiet:
+            print(f"  wrote: {path}")
+
+    return tuple(written)
+
+
 def build_argument_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="python -m steps.step02_prepare_frame_groups",
@@ -581,6 +674,17 @@ def build_argument_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("manifest", type=Path)
     parser.add_argument("--frame-root", type=Path, default=None)
+    parser.add_argument(
+        "--statistics-dir",
+        type=Path,
+        default=None,
+        help="Compute per-frame statistics and write one CSV per dataset.",
+    )
+    parser.add_argument(
+        "--quiet",
+        action="store_true",
+        help="Suppress normal summary and progress output.",
+    )
     parser.add_argument(
         "--version",
         action="version",
@@ -596,11 +700,18 @@ def main(argv: Sequence[str] | None = None) -> int:
             args.manifest,
             frame_root=args.frame_root,
         )
+        if args.statistics_dir is not None:
+            write_all_statistics_csv(
+                result,
+                args.statistics_dir,
+                quiet=args.quiet,
+            )
     except Step02Error as exc:
         print(f"Step 02 error: {exc}", file=sys.stderr)
         return 2
 
-    print(result.summary())
+    if not args.quiet:
+        print(result.summary())
     return 0
 
 
