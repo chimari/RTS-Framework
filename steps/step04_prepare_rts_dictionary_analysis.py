@@ -1,7 +1,7 @@
 """Step 04: prepare an RTS dictionary analysis plan.
 
-Version 4.21.0 adds immutable dictionary-build parameters to structured
-build results while preserving CSV output and existing public APIs.
+Version 4.22.0 adds deterministic atomic metadata JSON output paired with
+dictionary CSV builds while preserving all existing public APIs.
 """
 
 from __future__ import annotations
@@ -10,10 +10,11 @@ from pathlib import Path
 from time import monotonic
 
 import csv
+import json
 import os
 import tempfile
 
-__version__ = "4.21.0"
+__version__ = "4.22.0"
 
 from dataclasses import dataclass
 
@@ -31,6 +32,7 @@ __all__ = [
     "PixelTimeSeriesStatistics",
     "RTSCandidateResult",
     "RTSDictionaryBuildResult",
+    "RTSDictionaryArtifactResult",
     "RTSProgressState",
     "RTSCancellationInfo",
     "RTSDictionaryBuildParameters",
@@ -57,6 +59,8 @@ __all__ = [
     "prepare_rts_dictionary_analysis",
     "rts_candidate_to_row",
     "write_rts_dictionary_csv",
+    "write_rts_dictionary_metadata_json",
+    "build_rts_dictionary_artifacts",
     "build_rts_dictionary_csv",
     "build_rts_dictionary_csv_result",
 ]
@@ -521,6 +525,28 @@ class RTSDictionaryBuildResult:
         }
 
 
+
+@dataclass(slots=True, frozen=True)
+class RTSDictionaryArtifactResult:
+    """Immutable paths and build metadata for a CSV/JSON artifact pair."""
+
+    build_result: RTSDictionaryBuildResult
+    metadata_path: Path
+
+    @property
+    def output_path(self) -> Path:
+        """Return the RTS dictionary CSV path."""
+        return self.build_result.output_path
+
+    def summary(self) -> dict[str, object]:
+        """Return a deterministic JSON-serializable artifact summary."""
+        return {
+            "output_path": str(self.output_path),
+            "metadata_path": str(self.metadata_path),
+            "build": self.build_result.summary(),
+        }
+
+
 @dataclass(slots=True, frozen=True)
 class RTSDictionaryPlan:
     """Immutable metadata plan for later RTS dictionary generation."""
@@ -968,6 +994,164 @@ def build_rts_dictionary_csv_result(
         candidate_count=candidate_count,
         parameters=parameters,
     )
+
+
+def _default_metadata_path(output_path: Path) -> Path:
+    """Return the canonical sidecar metadata path for a CSV destination."""
+    return output_path.with_name(f"{output_path.name}.metadata.json")
+
+
+def _dictionary_metadata_document(
+    plan: RTSDictionaryPlan,
+    result: RTSDictionaryBuildResult,
+) -> dict[str, object]:
+    """Return the canonical metadata document for one completed build."""
+    bias = plan.bias_plan
+    return {
+        "schema": "rts-framework.step04.dictionary-metadata",
+        "schema_version": 1,
+        "step04_version": __version__,
+        "dictionary": {
+            "csv_path": str(result.output_path),
+            "dataset": result.dataset,
+            "analyzed_pixel_count": result.analyzed_pixel_count,
+            "candidate_count": result.candidate_count,
+        },
+        "input": {
+            "dataset": plan.dataset,
+            "n_frames": plan.n_frames,
+            "image_shape": list(plan.image_shape),
+            "minimum_frames": plan.minimum_frames,
+            "pixel_dtype": bias.pixel_dtype,
+            "exposure_s": float(bias.exposure_s),
+            "temperature_min_C": float(bias.temperature_min_C),
+            "temperature_max_C": float(bias.temperature_max_C),
+            "filepaths": [str(path) for path in bias.filepaths],
+        },
+        "parameters": result.parameters.summary(),
+    }
+
+
+def write_rts_dictionary_metadata_json(
+    path,
+    plan: RTSDictionaryPlan,
+    result: RTSDictionaryBuildResult,
+) -> Path:
+    """Atomically write deterministic UTF-8 metadata JSON for a CSV build."""
+    if not isinstance(plan, RTSDictionaryPlan):
+        raise Step04Error("plan must be an RTSDictionaryPlan.")
+    if not isinstance(result, RTSDictionaryBuildResult):
+        raise Step04Error("result must be an RTSDictionaryBuildResult.")
+
+    try:
+        destination = Path(path)
+    except TypeError as exc:
+        raise Step04Error("path must be path-like.") from exc
+
+    if destination.exists() and destination.is_dir():
+        raise Step04Error(f"path must not be a directory: {destination}")
+
+    parent = destination.parent
+    try:
+        parent.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        raise Step04Error(
+            f"Could not create output directory '{parent}': {exc}"
+        ) from exc
+
+    document = _dictionary_metadata_document(plan, result)
+    temporary_path: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            newline="\n",
+            dir=parent,
+            prefix=f".{destination.name}.",
+            suffix=".tmp",
+            delete=False,
+        ) as stream:
+            temporary_path = Path(stream.name)
+            json.dump(
+                document,
+                stream,
+                ensure_ascii=False,
+                indent=2,
+                sort_keys=True,
+                allow_nan=False,
+            )
+            stream.write("\n")
+            stream.flush()
+            os.fsync(stream.fileno())
+
+        os.replace(temporary_path, destination)
+        temporary_path = None
+        return destination
+
+    except (OSError, TypeError, ValueError) as exc:
+        raise Step04Error(
+            f"Could not write RTS dictionary metadata JSON "
+            f"'{destination}': {exc}"
+        ) from exc
+    finally:
+        if temporary_path is not None:
+            try:
+                temporary_path.unlink(missing_ok=True)
+            except OSError:
+                pass
+
+
+def build_rts_dictionary_artifacts(
+    plan: RTSDictionaryPlan,
+    output_path,
+    *,
+    metadata_path=None,
+    row_start: int | None = None,
+    row_stop: int | None = None,
+    column_start: int | None = None,
+    column_stop: int | None = None,
+    minimum_score: float = 0.0,
+    minimum_state_count: int = 1,
+    minimum_separation: float = 0.0,
+    minimum_transition_count: int = 0,
+    minimum_lower_run: int = 1,
+    minimum_upper_run: int = 1,
+    progress_callback=None,
+    cancel_requested=None,
+) -> RTSDictionaryArtifactResult:
+    """Build an RTS dictionary CSV and its deterministic metadata sidecar."""
+    result = build_rts_dictionary_csv_result(
+        plan,
+        output_path,
+        row_start=row_start,
+        row_stop=row_stop,
+        column_start=column_start,
+        column_stop=column_stop,
+        minimum_score=minimum_score,
+        minimum_state_count=minimum_state_count,
+        minimum_separation=minimum_separation,
+        minimum_transition_count=minimum_transition_count,
+        minimum_lower_run=minimum_lower_run,
+        minimum_upper_run=minimum_upper_run,
+        progress_callback=progress_callback,
+        cancel_requested=cancel_requested,
+    )
+    resolved_metadata_path = (
+        _default_metadata_path(result.output_path)
+        if metadata_path is None
+        else Path(metadata_path)
+    )
+    written_metadata_path = write_rts_dictionary_metadata_json(
+        resolved_metadata_path,
+        plan,
+        result,
+    )
+    return RTSDictionaryArtifactResult(
+        build_result=result,
+        metadata_path=written_metadata_path,
+    )
+
+
 
 def write_rts_dictionary_csv(path, candidates) -> Path:
     """Atomically write final RTS candidates to a deterministic UTF-8 CSV.
