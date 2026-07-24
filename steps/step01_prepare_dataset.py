@@ -7,9 +7,10 @@ immutable result object.  No RTS detection or image statistics are performed.
 
 from __future__ import annotations
 
-__version__ = "1.3.0"
+__version__ = "1.4.0"
 
 import argparse
+import csv
 from dataclasses import dataclass
 import json
 from pathlib import Path
@@ -90,6 +91,107 @@ class Step01Result:
         return "\n".join(lines)
 
 
+
+
+NORMALIZED_MANIFEST_COLUMNS = (
+    "dataset",
+    "directory",
+    "environment",
+    "frame_index",
+    "n_frames",
+    "temperature_C",
+    "temperature_start_C",
+    "temperature_end_C",
+    "temperature_fraction",
+    "exposure_s",
+    "filename",
+    "filepath",
+    "image_width",
+    "image_height",
+    "pixel_dtype",
+    "byte_order",
+)
+
+
+def write_normalized_manifest(
+    result: Step01Result,
+    output_path: str | Path,
+) -> Path:
+    """Write a validated manifest in the canonical RTS CSV representation.
+
+    The output has a fixed column order, absolute frame paths, LF line endings,
+    and deterministic row ordering by dataset and frame index.  A normalized
+    manifest is written only when the complete Step 01 result is valid.
+
+    Parameters
+    ----------
+    result
+        Result returned by :func:`prepare_dataset`.
+    output_path
+        Destination CSV path. Parent directories are created automatically.
+
+    Returns
+    -------
+    Path
+        The destination path.
+
+    Raises
+    ------
+    Step01Error
+        If validation failed or the destination cannot be written.
+    """
+    if not result.valid:
+        raise Step01Error(
+            "Cannot write normalized manifest because Step 01 validation failed."
+        )
+
+    path = Path(output_path)
+    ordered_frames = sorted(
+        result.manifest.frames,
+        key=lambda frame: (
+            frame.dataset,
+            frame.frame_index,
+            frame.manifest_row,
+        ),
+    )
+
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("w", encoding="utf-8", newline="") as stream:
+            writer = csv.DictWriter(
+                stream,
+                fieldnames=NORMALIZED_MANIFEST_COLUMNS,
+                lineterminator="\n",
+            )
+            writer.writeheader()
+            for frame in ordered_frames:
+                absolute_path = frame.filepath.resolve()
+                writer.writerow(
+                    {
+                        "dataset": frame.dataset,
+                        "directory": str(absolute_path.parent),
+                        "environment": frame.environment,
+                        "frame_index": frame.frame_index,
+                        "n_frames": frame.n_frames,
+                        "temperature_C": frame.temperature_C,
+                        "temperature_start_C": frame.temperature_start_C,
+                        "temperature_end_C": frame.temperature_end_C,
+                        "temperature_fraction": frame.temperature_fraction,
+                        "exposure_s": frame.exposure_s,
+                        "filename": absolute_path.name,
+                        "filepath": str(absolute_path),
+                        "image_width": frame.image_width,
+                        "image_height": frame.image_height,
+                        "pixel_dtype": frame.pixel_dtype,
+                        "byte_order": frame.byte_order,
+                    }
+                )
+    except (OSError, csv.Error, TypeError, ValueError) as exc:
+        raise Step01Error(
+            f"Unable to write normalized manifest: {path}: {exc}"
+        ) from exc
+
+    return path
 
 def write_report(
     result: Step01Result,
@@ -318,6 +420,15 @@ def build_argument_parser() -> argparse.ArgumentParser:
         help="Optional destination for the machine-readable JSON report.",
     )
     parser.add_argument(
+        "--normalized-manifest",
+        type=Path,
+        default=None,
+        help=(
+            "Optional destination for a canonical CSV manifest. "
+            "Written only when validation passes."
+        ),
+    )
+    parser.add_argument(
         "--quiet",
         action="store_true",
         help="Suppress per-frame progress messages.",
@@ -383,6 +494,19 @@ def main(argv: Sequence[str] | None = None) -> int:
         if args.report is not None:
             report_path = write_report(result, args.report)
             print(f"JSON report: {report_path}")
+
+        if args.normalized_manifest is not None:
+            if result.valid:
+                normalized_path = write_normalized_manifest(
+                    result,
+                    args.normalized_manifest,
+                )
+                print(f"Normalized manifest: {normalized_path}")
+            else:
+                print(
+                    "Normalized manifest not written: validation failed.",
+                    file=sys.stderr,
+                )
 
     except Step01Error as exc:
         print(f"Step 01 error: {exc}", file=sys.stderr)
