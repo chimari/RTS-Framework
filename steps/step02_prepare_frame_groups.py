@@ -7,7 +7,7 @@ No image pixels are read in this step.
 
 from __future__ import annotations
 
-__version__ = "2.6.0"
+__version__ = "2.7.0"
 
 import argparse
 import csv
@@ -24,7 +24,30 @@ import numpy as np
 
 from common.image_io import read_image
 
+
 from common.manifest import FrameManifest, FrameRecord, ManifestError
+
+
+__all__ = [
+    "DatasetGroup",
+    "DatasetStatistics",
+    "FrameStatistics",
+    "STATISTICS_CSV_COLUMNS",
+    "Step02Error",
+    "Step02Result",
+    "build_argument_parser",
+    "build_statistics_summary",
+    "compute_dataset_statistics",
+    "iter_dataset_images",
+    "main",
+    "prepare_frame_groups",
+    "statistics_filename",
+    "statistics_summary_filename",
+    "write_all_statistics_csv",
+    "write_all_statistics_summary_json",
+    "write_statistics_csv",
+    "write_statistics_summary_json",
+]
 
 
 class Step02Error(Exception):
@@ -859,33 +882,57 @@ def write_all_statistics_summary_json(
     return tuple(written)
 
 def build_argument_parser() -> argparse.ArgumentParser:
+    """Build the public Step 02 command-line interface."""
     parser = argparse.ArgumentParser(
         prog="python -m steps.step02_prepare_frame_groups",
-        description="Group a validated RTS manifest by dataset.",
+        description=(
+            "Validate and group a normalized RTS manifest, optionally "
+            "exporting deterministic per-frame CSV statistics and dataset "
+            "summary JSON files."
+        ),
+        epilog=(
+            "Exit status: 0 on success, 2 for command-line or Step 02 errors. "
+            "When both output directories are omitted, only the validated "
+            "dataset-group summary is printed."
+        ),
     )
-    parser.add_argument("manifest", type=Path)
-    parser.add_argument("--frame-root", type=Path, default=None)
+    parser.add_argument(
+        "manifest",
+        type=Path,
+        metavar="MANIFEST",
+        help="Normalized Step 01 manifest CSV.",
+    )
+    parser.add_argument(
+        "--frame-root",
+        type=Path,
+        default=None,
+        metavar="DIRECTORY",
+        help="Resolve relative manifest filepaths below this directory.",
+    )
     parser.add_argument(
         "--statistics-dir",
         type=Path,
         default=None,
-        help="Compute per-frame statistics and write one CSV per dataset.",
+        metavar="DIRECTORY",
+        help="Write one deterministic per-frame statistics CSV per dataset.",
     )
     parser.add_argument(
         "--summary-dir",
         type=Path,
         default=None,
-        help="Compute statistics and write one summary JSON per dataset.",
+        metavar="DIRECTORY",
+        help="Write one deterministic statistics-summary JSON per dataset.",
     )
     parser.add_argument(
         "--quiet",
         action="store_true",
-        help="Suppress normal summary and progress output.",
+        help="Suppress normal progress and result-summary output.",
     )
     parser.add_argument(
         "--version",
         action="version",
         version=f"%(prog)s {__version__}",
+        help="Show the Step 02 version and exit.",
     )
     return parser
 
