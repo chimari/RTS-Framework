@@ -1,13 +1,13 @@
 """Step 03: prepare one dataset for bias and RTS analysis.
 
-Version 3.3.0 adds an exact full-stack median master-bias reference
-implementation. It reads each frame once, retains the complete float64
-image stack, and returns an immutable read-only median master image.
+Version 3.4.0 adds deterministic image-stack memory estimation for later
+full-stack, tiled, variance-cube, and RTS-analysis operations. The estimator
+is informational only and does not warn, reject, or inspect system memory.
 """
 
 from __future__ import annotations
 
-__version__ = "3.3.0"
+__version__ = "3.4.0"
 
 from dataclasses import dataclass
 import math
@@ -30,9 +30,11 @@ __all__ = [
     "BiasAnalysisPlan",
     "MeanMasterBiasResult",
     "MedianMasterBiasResult",
+    "MemoryEstimate",
     "Step03Error",
     "compute_mean_master_bias",
     "compute_median_master_bias",
+    "estimate_image_stack_memory",
     "iter_bias_frames",
     "prepare_bias_analysis",
 ]
@@ -70,6 +72,39 @@ class MedianMasterBiasResult:
     maximum: float
     median: float
 
+
+
+
+@dataclass(slots=True, frozen=True)
+class MemoryEstimate:
+    """Immutable deterministic estimate for a dense image stack."""
+
+    n_frames: int
+    image_shape: tuple[int, int]
+    dtype: str
+    bytes_per_pixel: int
+    pixel_count: int
+    total_bytes: int
+    kibibytes: float
+    mebibytes: float
+    gibibytes: float
+
+    def summary(self) -> dict[str, object]:
+        """Return a canonical JSON-serializable summary."""
+        return {
+            "n_frames": self.n_frames,
+            "image_shape": [
+                self.image_shape[0],
+                self.image_shape[1],
+            ],
+            "dtype": self.dtype,
+            "bytes_per_pixel": self.bytes_per_pixel,
+            "pixel_count": self.pixel_count,
+            "total_bytes": self.total_bytes,
+            "kibibytes": self.kibibytes,
+            "mebibytes": self.mebibytes,
+            "gibibytes": self.gibibytes,
+        }
 
 
 @dataclass(slots=True, frozen=True)
@@ -174,6 +209,78 @@ def prepare_bias_analysis(
     )
 
 
+
+def estimate_image_stack_memory(
+    plan: BiasAnalysisPlan,
+    *,
+    dtype: "np.dtype[object] | str | type" = np.float64,
+) -> MemoryEstimate:
+    """Estimate memory required by a dense ``(frames, height, width)`` stack.
+
+    The calculation is deterministic and does not allocate image data, read
+    files, inspect available RAM, emit warnings, or enforce a memory policy.
+
+    Parameters
+    ----------
+    plan
+        Bias-analysis plan returned by :func:`prepare_bias_analysis`.
+    dtype
+        NumPy-compatible stack dtype. The default is ``numpy.float64``.
+
+    Returns
+    -------
+    MemoryEstimate
+        Exact byte count plus binary-unit convenience values.
+
+    Raises
+    ------
+    Step03Error
+        If ``plan`` or ``dtype`` is invalid.
+    """
+    if not isinstance(plan, BiasAnalysisPlan):
+        raise Step03Error(
+            "plan must be a BiasAnalysisPlan returned by "
+            "prepare_bias_analysis()."
+        )
+
+    try:
+        resolved_dtype = np.dtype(dtype)
+    except (TypeError, ValueError) as exc:
+        raise Step03Error(f"Invalid stack dtype {dtype!r}.") from exc
+
+    if resolved_dtype.fields is not None:
+        raise Step03Error(
+            f"Stack dtype {resolved_dtype.str!r} must not be structured."
+        )
+    if resolved_dtype.hasobject:
+        raise Step03Error(
+            f"Stack dtype {resolved_dtype.str!r} must not contain objects."
+        )
+    if resolved_dtype.itemsize <= 0:
+        raise Step03Error(
+            f"Stack dtype {resolved_dtype.str!r} has no fixed positive item size."
+        )
+    if resolved_dtype.kind not in "biufc":
+        raise Step03Error(
+            f"Stack dtype {resolved_dtype.str!r} must be numeric."
+        )
+
+    height, width = plan.image_shape
+    pixel_count = plan.n_frames * height * width
+    total_bytes = pixel_count * resolved_dtype.itemsize
+
+    return MemoryEstimate(
+        n_frames=plan.n_frames,
+        image_shape=plan.image_shape,
+        dtype=resolved_dtype.name,
+        bytes_per_pixel=resolved_dtype.itemsize,
+        pixel_count=pixel_count,
+        total_bytes=total_bytes,
+        kibibytes=total_bytes / 1024.0,
+        mebibytes=total_bytes / (1024.0 ** 2),
+        gibibytes=total_bytes / (1024.0 ** 3),
+    )
+
 def compute_median_master_bias(
     plan: BiasAnalysisPlan,
 ) -> MedianMasterBiasResult:
@@ -213,8 +320,9 @@ def compute_median_master_bias(
             "prepare_bias_analysis()."
         )
 
+    estimate = estimate_image_stack_memory(plan, dtype=np.float64)
     stack = np.empty(
-        (plan.n_frames, *plan.image_shape),
+        (estimate.n_frames, *estimate.image_shape),
         dtype=np.float64,
         order="C",
     )
