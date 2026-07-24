@@ -1,12 +1,12 @@
 """Step 04: prepare an RTS dictionary analysis plan.
 
-Version 4.5.0 adds deterministic temporal transition analysis for one
-PixelTimeSeries using the two fitted state centers from TwoStateScoreResult.
+Version 4.6.0 adds deterministic temporal RTS-candidate classification by
+combining an existing RTSCandidateResult with TwoStateTransitionResult.
 """
 
 from __future__ import annotations
 
-__version__ = "4.5.0"
+__version__ = "4.6.0"
 
 from dataclasses import dataclass
 
@@ -25,10 +25,12 @@ __all__ = [
     "RTSCandidateResult",
     "RTSDictionaryPlan",
     "Step04Error",
+    "TemporalRTSCandidateResult",
     "TwoStateScoreResult",
     "TwoStateTransitionResult",
     "analyze_two_state_transitions",
     "classify_rts_candidate",
+    "classify_temporal_rts_candidate",
     "compute_pixel_timeseries_statistics",
     "compute_two_state_score",
     "load_pixel_timeseries",
@@ -43,6 +45,60 @@ class Step04Error(Exception):
 
 
 
+
+
+
+@dataclass(slots=True, frozen=True)
+class TemporalRTSCandidateResult:
+    """Immutable temporal extension of one RTS candidate classification."""
+
+    candidate_result: "RTSCandidateResult"
+    transition_result: "TwoStateTransitionResult"
+    minimum_transition_count: int
+    minimum_lower_run: int
+    minimum_upper_run: int
+    passes_base_candidate: bool
+    passes_transition_count: bool
+    passes_lower_run: bool
+    passes_upper_run: bool
+    is_candidate: bool
+
+    @property
+    def failed_conditions(self) -> tuple[str, ...]:
+        """Return failed condition names in canonical order."""
+        failed: list[str] = []
+        if not self.passes_base_candidate:
+            failed.append("base_candidate")
+        if not self.passes_transition_count:
+            failed.append("transition_count")
+        if not self.passes_lower_run:
+            failed.append("lower_run")
+        if not self.passes_upper_run:
+            failed.append("upper_run")
+        return tuple(failed)
+
+    def summary(self) -> dict[str, object]:
+        """Return a canonical JSON-serializable temporal classification summary."""
+        transition = self.transition_result
+        return {
+            "dataset": transition.series.dataset,
+            "row": transition.series.row,
+            "column": transition.series.column,
+            "n_frames": transition.series.n_frames,
+            "base_candidate": self.candidate_result.is_candidate,
+            "transition_count": transition.transition_count,
+            "longest_lower_run": transition.longest_lower_run,
+            "longest_upper_run": transition.longest_upper_run,
+            "minimum_transition_count": self.minimum_transition_count,
+            "minimum_lower_run": self.minimum_lower_run,
+            "minimum_upper_run": self.minimum_upper_run,
+            "passes_base_candidate": self.passes_base_candidate,
+            "passes_transition_count": self.passes_transition_count,
+            "passes_lower_run": self.passes_lower_run,
+            "passes_upper_run": self.passes_upper_run,
+            "is_candidate": self.is_candidate,
+            "failed_conditions": list(self.failed_conditions),
+        }
 
 
 @dataclass(slots=True, frozen=True)
@@ -242,6 +298,132 @@ class RTSDictionaryPlan:
 
 
 
+
+
+def classify_temporal_rts_candidate(
+    candidate_result: RTSCandidateResult,
+    transition_result: TwoStateTransitionResult,
+    *,
+    minimum_transition_count: int,
+    minimum_lower_run: int,
+    minimum_upper_run: int,
+) -> TemporalRTSCandidateResult:
+    """Extend one RTS candidate decision with explicit temporal conditions.
+
+    A result is a temporal RTS candidate only when all of the following are true:
+
+    1. ``candidate_result.is_candidate`` is true
+    2. ``transition_result.transition_count >= minimum_transition_count``
+    3. ``transition_result.longest_lower_run >= minimum_lower_run``
+    4. ``transition_result.longest_upper_run >= minimum_upper_run``
+
+    Threshold comparisons are inclusive. This function does not reinterpret the
+    two-state fit, alter the base candidate thresholds, or apply elapsed-time,
+    cadence, dwell-duration, hysteresis, read-noise, or neighboring-pixel tests.
+
+    Parameters
+    ----------
+    candidate_result
+        Result returned by :func:`classify_rts_candidate`.
+    transition_result
+        Result returned by :func:`analyze_two_state_transitions` for the same
+        exact PixelTimeSeries and TwoStateScoreResult objects.
+    minimum_transition_count
+        Inclusive minimum number of state changes.
+    minimum_lower_run
+        Inclusive minimum longest consecutive run in the lower state.
+    minimum_upper_run
+        Inclusive minimum longest consecutive run in the upper state.
+
+    Returns
+    -------
+    TemporalRTSCandidateResult
+        Immutable combined classification with each temporal condition retained
+        separately.
+
+    Raises
+    ------
+    Step04Error
+        If inputs are invalid, inconsistent, or thresholds are not integers
+        greater than or equal to zero for transition count and one for runs.
+    """
+    if not isinstance(candidate_result, RTSCandidateResult):
+        raise Step04Error(
+            "candidate_result must be an RTSCandidateResult returned by "
+            "classify_rts_candidate()."
+        )
+    if not isinstance(transition_result, TwoStateTransitionResult):
+        raise Step04Error(
+            "transition_result must be a TwoStateTransitionResult returned by "
+            "analyze_two_state_transitions()."
+        )
+
+    if candidate_result.score_result is not transition_result.score_result:
+        raise Step04Error(
+            "candidate_result and transition_result must refer to the same "
+            "TwoStateScoreResult object."
+        )
+    if candidate_result.score_result.series is not transition_result.series:
+        raise Step04Error(
+            "candidate_result and transition_result must refer to the same "
+            "PixelTimeSeries object."
+        )
+
+    def require_integer(name: str, value: object, minimum: int) -> int:
+        if isinstance(value, bool) or not isinstance(value, (int, np.integer)):
+            comparator = ">= 0" if minimum == 0 else ">= 1"
+            raise Step04Error(f"{name} must be an integer {comparator}.")
+        converted = int(value)
+        if converted < minimum:
+            comparator = ">= 0" if minimum == 0 else ">= 1"
+            raise Step04Error(f"{name} must be an integer {comparator}.")
+        return converted
+
+    minimum_transition_count = require_integer(
+        "minimum_transition_count",
+        minimum_transition_count,
+        0,
+    )
+    minimum_lower_run = require_integer(
+        "minimum_lower_run",
+        minimum_lower_run,
+        1,
+    )
+    minimum_upper_run = require_integer(
+        "minimum_upper_run",
+        minimum_upper_run,
+        1,
+    )
+
+    passes_base_candidate = candidate_result.is_candidate
+    passes_transition_count = (
+        transition_result.transition_count >= minimum_transition_count
+    )
+    passes_lower_run = (
+        transition_result.longest_lower_run >= minimum_lower_run
+    )
+    passes_upper_run = (
+        transition_result.longest_upper_run >= minimum_upper_run
+    )
+    is_candidate = (
+        passes_base_candidate
+        and passes_transition_count
+        and passes_lower_run
+        and passes_upper_run
+    )
+
+    return TemporalRTSCandidateResult(
+        candidate_result=candidate_result,
+        transition_result=transition_result,
+        minimum_transition_count=minimum_transition_count,
+        minimum_lower_run=minimum_lower_run,
+        minimum_upper_run=minimum_upper_run,
+        passes_base_candidate=passes_base_candidate,
+        passes_transition_count=passes_transition_count,
+        passes_lower_run=passes_lower_run,
+        passes_upper_run=passes_upper_run,
+        is_candidate=is_candidate,
+    )
 
 def analyze_two_state_transitions(
     series: PixelTimeSeries,
