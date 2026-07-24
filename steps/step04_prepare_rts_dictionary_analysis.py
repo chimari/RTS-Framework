@@ -1,12 +1,12 @@
 """Step 04: prepare an RTS dictionary analysis plan.
 
-Version 4.11.0 adds deterministic lazy filtering of final RTS candidate
-results without copying or modifying the analysis result objects.
+Version 4.12.0 adds deterministic flat-row serialization for one final
+RTS candidate without performing file I/O.
 """
 
 from __future__ import annotations
 
-__version__ = "4.11.0"
+__version__ = "4.12.0"
 
 from dataclasses import dataclass
 
@@ -41,6 +41,7 @@ __all__ = [
     "iter_rts_pixel_analyses",
     "load_pixel_timeseries",
     "prepare_rts_dictionary_analysis",
+    "rts_candidate_to_row",
 ]
 
 
@@ -419,6 +420,76 @@ def iter_image_coordinates(
             yield (row, column)
 
 
+
+
+def rts_candidate_to_row(result: RTSPixelAnalysisResult) -> dict[str, object]:
+    """Return one final RTS candidate as a deterministic flat CSV-ready row.
+
+    The returned dictionary uses insertion order as the canonical column order.
+    Values are limited to strings, integers, finite floats, and booleans. No
+    file is opened and the source result is not modified.
+
+    Parameters
+    ----------
+    result
+        Final candidate result produced by :func:`analyze_rts_pixel`.
+
+    Returns
+    -------
+    dict[str, object]
+        A new flat dictionary in canonical RTS-dictionary column order.
+
+    Raises
+    ------
+    Step04Error
+        If ``result`` is not an :class:`RTSPixelAnalysisResult` or is not a
+        final RTS candidate.
+    """
+    if not isinstance(result, RTSPixelAnalysisResult):
+        raise Step04Error("result must be an RTSPixelAnalysisResult.")
+    if not result.is_candidate:
+        raise Step04Error("result must be a final RTS candidate.")
+
+    series = result.series
+    statistics = result.statistics
+    score = result.score
+    candidate = result.candidate
+    transitions = result.transitions
+    temporal = result.temporal_candidate
+
+    return {
+        "dataset": series.dataset,
+        "row": series.row,
+        "column": series.column,
+        "n_frames": series.n_frames,
+        "minimum": statistics.minimum,
+        "maximum": statistics.maximum,
+        "mean": statistics.mean,
+        "median": statistics.median,
+        "standard_deviation": statistics.standard_deviation,
+        "median_absolute_deviation": statistics.median_absolute_deviation,
+        "peak_to_peak": statistics.peak_to_peak,
+        "lower_state_count": score.lower_state_count,
+        "upper_state_count": score.upper_state_count,
+        "lower_state_center": score.lower_state_center,
+        "upper_state_center": score.upper_state_center,
+        "state_separation": score.state_separation,
+        "single_state_residual": score.single_state_residual,
+        "two_state_residual": score.two_state_residual,
+        "two_state_score": score.score,
+        "minimum_score": candidate.minimum_score,
+        "minimum_state_count": candidate.minimum_state_count,
+        "minimum_separation": candidate.minimum_separation,
+        "transition_count": transitions.transition_count,
+        "lower_to_upper_count": transitions.lower_to_upper_count,
+        "upper_to_lower_count": transitions.upper_to_lower_count,
+        "longest_lower_run": transitions.longest_lower_run,
+        "longest_upper_run": transitions.longest_upper_run,
+        "minimum_transition_count": temporal.minimum_transition_count,
+        "minimum_lower_run": temporal.minimum_lower_run,
+        "minimum_upper_run": temporal.minimum_upper_run,
+        "is_candidate": result.is_candidate,
+    }
 
 def iter_rts_candidates(results):
     """Yield only final RTS candidates from an analysis-result iterable.
