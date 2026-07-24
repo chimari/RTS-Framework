@@ -1,13 +1,13 @@
 """Step 03: prepare one dataset for bias and RTS analysis.
 
-Version 3.1.0 adds lazy bias-frame iteration on top of the validated Step 02
-dataset. Each image is converted to an independent, C-contiguous, read-only
-float64 array suitable for later master-bias and RTS-analysis milestones.
+Version 3.2.0 adds one-pass arithmetic-mean master-bias computation on top
+of lazy bias-frame iteration. The result is an immutable metadata object
+containing a read-only, C-contiguous float64 master image.
 """
 
 from __future__ import annotations
 
-__version__ = "3.1.0"
+__version__ = "3.2.0"
 
 from dataclasses import dataclass
 import math
@@ -28,7 +28,9 @@ from steps.step02_prepare_frame_groups import (
 
 __all__ = [
     "BiasAnalysisPlan",
+    "MeanMasterBiasResult",
     "Step03Error",
+    "compute_mean_master_bias",
     "iter_bias_frames",
     "prepare_bias_analysis",
 ]
@@ -36,6 +38,21 @@ __all__ = [
 
 class Step03Error(Exception):
     """Raised when Step 03 cannot prepare a bias-analysis dataset."""
+
+
+@dataclass(slots=True, frozen=True)
+class MeanMasterBiasResult:
+    """Immutable arithmetic-mean master-bias result."""
+
+    plan: "BiasAnalysisPlan"
+    dataset: str
+    n_frames: int
+    image_shape: tuple[int, int]
+    master_bias: np.ndarray
+    minimum: float
+    maximum: float
+    mean: float
+
 
 
 @dataclass(slots=True, frozen=True)
@@ -137,6 +154,74 @@ def prepare_bias_analysis(
         exposure_s=group.exposure_s,
         temperature_min_C=group.temperature_min_C,
         temperature_max_C=group.temperature_max_C,
+    )
+
+
+def compute_mean_master_bias(
+    plan: BiasAnalysisPlan,
+) -> MeanMasterBiasResult:
+    """Compute an arithmetic-mean master bias in one streaming pass.
+
+    Images are obtained exclusively from :func:`iter_bias_frames`. The function
+    keeps one float64 accumulation array and the current frame in memory; it
+    never materializes the complete image stack.
+
+    Parameters
+    ----------
+    plan
+        Bias-analysis plan returned by :func:`prepare_bias_analysis`.
+
+    Returns
+    -------
+    MeanMasterBiasResult
+        Immutable result containing a read-only master-bias image.
+
+    Raises
+    ------
+    Step03Error
+        If ``plan`` is invalid, no frames are yielded, the iterator yields an
+        unexpected frame count, or an image violates the planned shape.
+    """
+    if not isinstance(plan, BiasAnalysisPlan):
+        raise Step03Error(
+            "plan must be a BiasAnalysisPlan returned by "
+            "prepare_bias_analysis()."
+        )
+
+    accumulator = np.zeros(plan.image_shape, dtype=np.float64, order="C")
+    count = 0
+
+    for image in iter_bias_frames(plan):
+        if image.shape != plan.image_shape:
+            raise Step03Error(
+                f"Bias frame {count} has shape {image.shape!r}; "
+                f"expected {plan.image_shape!r}."
+            )
+        accumulator += image
+        count += 1
+
+    if count == 0:
+        raise Step03Error(
+            f"Bias dataset {plan.dataset!r} yielded no frames."
+        )
+    if count != plan.n_frames:
+        raise Step03Error(
+            f"Bias dataset {plan.dataset!r} yielded {count} frame(s); "
+            f"the analysis plan requires {plan.n_frames}."
+        )
+
+    accumulator /= float(count)
+    accumulator.setflags(write=False)
+
+    return MeanMasterBiasResult(
+        plan=plan,
+        dataset=plan.dataset,
+        n_frames=count,
+        image_shape=plan.image_shape,
+        master_bias=accumulator,
+        minimum=float(np.min(accumulator)),
+        maximum=float(np.max(accumulator)),
+        mean=float(np.mean(accumulator)),
     )
 
 
