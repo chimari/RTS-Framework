@@ -1,7 +1,7 @@
 """Step 04: prepare an RTS dictionary analysis plan.
 
-Version 4.24.0 adds validated RTS dictionary CSV loading into immutable
-structured objects while preserving all existing public APIs.
+Version 4.25.0 adds joint loading and cross-validation of RTS dictionary
+CSV/metadata artifact pairs while preserving all existing public APIs.
 """
 
 from __future__ import annotations
@@ -14,7 +14,7 @@ import json
 import os
 import tempfile
 
-__version__ = "4.24.0"
+__version__ = "4.25.0"
 
 from dataclasses import dataclass
 
@@ -36,6 +36,7 @@ __all__ = [
     "RTSDictionaryMetadata",
     "RTSDictionaryRow",
     "RTSDictionaryCSV",
+    "RTSDictionaryArtifacts",
     "RTSProgressState",
     "RTSCancellationInfo",
     "RTSDictionaryBuildParameters",
@@ -65,6 +66,7 @@ __all__ = [
     "write_rts_dictionary_metadata_json",
     "load_rts_dictionary_metadata_json",
     "load_rts_dictionary_csv",
+    "load_rts_dictionary_artifacts",
     "build_rts_dictionary_artifacts",
     "build_rts_dictionary_csv",
     "build_rts_dictionary_csv_result",
@@ -606,6 +608,34 @@ class RTSDictionaryCSV:
             "candidate_count": self.candidate_count,
             "datasets": self.datasets,
             "coordinates": tuple(row.coordinate for row in self.rows),
+        }
+
+
+
+@dataclass(slots=True, frozen=True)
+class RTSDictionaryArtifacts:
+    """Immutable validated RTS dictionary CSV/metadata artifact pair."""
+
+    dictionary: RTSDictionaryCSV
+    metadata: "RTSDictionaryMetadata"
+
+    @property
+    def candidate_count(self) -> int:
+        """Return the mutually validated candidate count."""
+        return self.dictionary.candidate_count
+
+    @property
+    def dataset(self) -> str:
+        """Return the mutually validated dataset name."""
+        return self.metadata.dataset
+
+    def summary(self) -> dict[str, object]:
+        """Return a deterministic JSON-serializable artifact summary."""
+        return {
+            "dataset": self.dataset,
+            "candidate_count": self.candidate_count,
+            "dictionary": self.dictionary.summary(),
+            "metadata": self.metadata.summary(),
         }
 
 
@@ -1420,6 +1450,110 @@ def load_rts_dictionary_csv(path) -> RTSDictionaryCSV:
         coordinates.add(key)
 
     return RTSDictionaryCSV(path=source, rows=rows)
+
+
+
+
+def _normalized_artifact_path(path: Path) -> Path:
+    """Return a non-strict absolute path for artifact identity checks."""
+    return path.expanduser().resolve(strict=False)
+
+
+def load_rts_dictionary_artifacts(
+    csv_path,
+    metadata_path=None,
+) -> RTSDictionaryArtifacts:
+    """Load and cross-validate one RTS dictionary CSV/metadata artifact pair.
+
+    When ``metadata_path`` is omitted, the canonical
+    ``<csv name>.metadata.json`` sidecar path is used.
+    """
+    try:
+        resolved_csv_path = Path(csv_path)
+    except TypeError as exc:
+        raise Step04Error("csv_path must be path-like.") from exc
+
+    if metadata_path is None:
+        resolved_metadata_path = _default_metadata_path(resolved_csv_path)
+    else:
+        try:
+            resolved_metadata_path = Path(metadata_path)
+        except TypeError as exc:
+            raise Step04Error("metadata_path must be path-like or None.") from exc
+
+    dictionary = load_rts_dictionary_csv(resolved_csv_path)
+    metadata = load_rts_dictionary_metadata_json(resolved_metadata_path)
+
+    if _normalized_artifact_path(metadata.csv_path) != (
+        _normalized_artifact_path(dictionary.path)
+    ):
+        raise Step04Error(
+            "metadata csv_path does not match the loaded dictionary CSV."
+        )
+
+    if metadata.candidate_count != dictionary.candidate_count:
+        raise Step04Error(
+            "metadata candidate_count does not match the dictionary CSV."
+        )
+
+    if dictionary.rows:
+        if dictionary.datasets != (metadata.dataset,):
+            raise Step04Error(
+                "dictionary CSV dataset does not match metadata dataset."
+            )
+
+    p = metadata.parameters
+    for row_number, row in enumerate(dictionary.rows, start=2):
+        if row.dataset != metadata.dataset:
+            raise Step04Error(
+                f"CSV row {row_number} dataset does not match metadata."
+            )
+        if row.n_frames != metadata.n_frames:
+            raise Step04Error(
+                f"CSV row {row_number} n_frames does not match metadata."
+            )
+        if not (p.row_start <= row.row < p.row_stop):
+            raise Step04Error(
+                f"CSV row {row_number} row lies outside metadata ROI."
+            )
+        if not (p.column_start <= row.column < p.column_stop):
+            raise Step04Error(
+                f"CSV row {row_number} column lies outside metadata ROI."
+            )
+        if row.minimum_score != p.minimum_score:
+            raise Step04Error(
+                f"CSV row {row_number} minimum_score does not match metadata."
+            )
+        if row.minimum_state_count != p.minimum_state_count:
+            raise Step04Error(
+                f"CSV row {row_number} minimum_state_count does not match "
+                "metadata."
+            )
+        if row.minimum_separation != p.minimum_separation:
+            raise Step04Error(
+                f"CSV row {row_number} minimum_separation does not match "
+                "metadata."
+            )
+        if row.minimum_transition_count != p.minimum_transition_count:
+            raise Step04Error(
+                f"CSV row {row_number} minimum_transition_count does not "
+                "match metadata."
+            )
+        if row.minimum_lower_run != p.minimum_lower_run:
+            raise Step04Error(
+                f"CSV row {row_number} minimum_lower_run does not match "
+                "metadata."
+            )
+        if row.minimum_upper_run != p.minimum_upper_run:
+            raise Step04Error(
+                f"CSV row {row_number} minimum_upper_run does not match "
+                "metadata."
+            )
+
+    return RTSDictionaryArtifacts(
+        dictionary=dictionary,
+        metadata=metadata,
+    )
 
 
 
