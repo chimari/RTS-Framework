@@ -1,17 +1,18 @@
 """Step 03: prepare one dataset for bias and RTS analysis.
 
-Version 3.0.0 intentionally performs no image-pixel reads.  It selects one
-validated Step 02 dataset and freezes the metadata required by later master-bias
-and RTS-analysis milestones.
+Version 3.1.0 adds lazy bias-frame iteration on top of the validated Step 02
+dataset. Each image is converted to an independent, C-contiguous, read-only
+float64 array suitable for later master-bias and RTS-analysis milestones.
 """
 
 from __future__ import annotations
 
-__version__ = "3.0.0"
+__version__ = "3.1.0"
 
 from dataclasses import dataclass
 import math
 from pathlib import Path
+from typing import Iterator
 
 import numpy as np
 
@@ -20,6 +21,7 @@ from steps.step02_prepare_frame_groups import (
     DatasetGroup,
     Step02Error,
     Step02Result,
+    iter_dataset_images,
     prepare_frame_groups,
 )
 
@@ -27,6 +29,7 @@ from steps.step02_prepare_frame_groups import (
 __all__ = [
     "BiasAnalysisPlan",
     "Step03Error",
+    "iter_bias_frames",
     "prepare_bias_analysis",
 ]
 
@@ -135,6 +138,57 @@ def prepare_bias_analysis(
         temperature_min_C=group.temperature_min_C,
         temperature_max_C=group.temperature_max_C,
     )
+
+
+def iter_bias_frames(
+    plan: BiasAnalysisPlan,
+) -> Iterator[np.ndarray]:
+    """Yield analysis-ready bias images in canonical frame order.
+
+    The underlying files are read lazily through the public Step 02 image
+    iterator. Each yielded image is a newly allocated array with these
+    guarantees:
+
+    - dtype is exactly ``numpy.float64``;
+    - layout is C-contiguous;
+    - the array is read-only;
+    - no previously yielded image is retained by this function.
+
+    Parameters
+    ----------
+    plan
+        Bias-analysis plan returned by :func:`prepare_bias_analysis`.
+
+    Yields
+    ------
+    numpy.ndarray
+        A two-dimensional analysis-ready image.
+
+    Raises
+    ------
+    Step03Error
+        If ``plan`` is invalid or Step 02 cannot read or revalidate a frame.
+    """
+    if not isinstance(plan, BiasAnalysisPlan):
+        raise Step03Error(
+            "plan must be a BiasAnalysisPlan returned by "
+            "prepare_bias_analysis()."
+        )
+
+    try:
+        for _frame, image in iter_dataset_images(plan.group):
+            converted = np.array(
+                image,
+                dtype=np.float64,
+                order="C",
+                copy=True,
+            )
+            converted.setflags(write=False)
+            yield converted
+    except Step02Error as exc:
+        raise Step03Error(
+            f"Unable to iterate bias dataset {plan.dataset!r}: {exc}"
+        ) from exc
 
 
 def _resolve_step02_result(
