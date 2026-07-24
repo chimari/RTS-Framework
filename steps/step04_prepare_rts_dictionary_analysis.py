@@ -1,7 +1,7 @@
 """Step 04: prepare an RTS dictionary analysis plan.
 
-Version 4.27.0 adds deterministic SHA-256 input-file fingerprints for
-RTS dictionary metadata while preserving all existing public APIs.
+Version 4.28.0 adds deterministic atomic JSON persistence and validated
+loading for input-file fingerprints while preserving existing APIs.
 """
 
 from __future__ import annotations
@@ -15,7 +15,7 @@ import json
 import os
 import tempfile
 
-__version__ = "4.27.0"
+__version__ = "4.28.0"
 
 from dataclasses import dataclass
 
@@ -73,6 +73,8 @@ __all__ = [
     "load_rts_dictionary_artifacts",
     "validate_rts_dictionary_input_files",
     "fingerprint_rts_dictionary_input_files",
+    "write_rts_input_file_fingerprints_json",
+    "load_rts_input_file_fingerprints_json",
     "build_rts_dictionary_artifacts",
     "build_rts_dictionary_csv",
     "build_rts_dictionary_csv_result",
@@ -1745,6 +1747,231 @@ def fingerprint_rts_dictionary_input_files(
         metadata_path=loaded.metadata_path,
         algorithm="sha256",
         files=tuple(fingerprints),
+    )
+
+
+
+
+RTS_INPUT_FINGERPRINT_SCHEMA = (
+    "rts-framework.step04.input-file-fingerprints"
+)
+RTS_INPUT_FINGERPRINT_SCHEMA_VERSION = 1
+
+
+def _default_fingerprint_json_path(metadata_path: Path) -> Path:
+    """Return the canonical fingerprint sidecar path."""
+    return Path(str(metadata_path) + ".fingerprints.json")
+
+
+def write_rts_input_file_fingerprints_json(
+    fingerprints,
+    output_path=None,
+) -> Path:
+    """Write one fingerprint inventory as deterministic atomic JSON.
+
+    ``fingerprints`` must be an :class:`RTSInputFileFingerprintSet`.
+    When ``output_path`` is omitted, the canonical
+    ``<metadata>.fingerprints.json`` path is used.
+    """
+    if not isinstance(fingerprints, RTSInputFileFingerprintSet):
+        raise Step04Error(
+            "fingerprints must be an RTSInputFileFingerprintSet."
+        )
+
+    if output_path is None:
+        destination = _default_fingerprint_json_path(
+            fingerprints.metadata_path
+        )
+    else:
+        try:
+            destination = Path(output_path)
+        except TypeError as exc:
+            raise Step04Error("output_path must be path-like or None.") from exc
+
+    document = {
+        "schema": RTS_INPUT_FINGERPRINT_SCHEMA,
+        "schema_version": RTS_INPUT_FINGERPRINT_SCHEMA_VERSION,
+        "step04_version": __version__,
+        "metadata_path": str(fingerprints.metadata_path),
+        "algorithm": fingerprints.algorithm,
+        "file_count": fingerprints.file_count,
+        "total_size_bytes": fingerprints.total_size_bytes,
+        "files": [item.summary() for item in fingerprints.files],
+    }
+
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    temporary = destination.with_name(destination.name + ".tmp")
+    try:
+        with temporary.open("w", encoding="utf-8", newline="\n") as stream:
+            json.dump(
+                document,
+                stream,
+                ensure_ascii=False,
+                indent=2,
+                sort_keys=True,
+            )
+            stream.write("\n")
+        os.replace(temporary, destination)
+    except OSError as exc:
+        try:
+            temporary.unlink(missing_ok=True)
+        except OSError:
+            pass
+        raise Step04Error(
+            f"Could not write input fingerprint JSON '{destination}': {exc}"
+        ) from exc
+
+    return destination
+
+
+def _require_fingerprint_mapping(value, name: str) -> dict:
+    if not isinstance(value, dict):
+        raise Step04Error(f"{name} must be a JSON object.")
+    return value
+
+
+def _require_fingerprint_string(value, name: str) -> str:
+    if not isinstance(value, str) or not value:
+        raise Step04Error(f"{name} must be a non-empty string.")
+    return value
+
+
+def _require_fingerprint_int(
+    value,
+    name: str,
+    *,
+    minimum: int = 0,
+) -> int:
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise Step04Error(f"{name} must be an integer.")
+    if value < minimum:
+        raise Step04Error(f"{name} must be at least {minimum}.")
+    return value
+
+
+def load_rts_input_file_fingerprints_json(
+    path,
+) -> RTSInputFileFingerprintSet:
+    """Load and validate one Step 04 input-file fingerprint JSON."""
+    try:
+        source = Path(path)
+    except TypeError as exc:
+        raise Step04Error("path must be path-like.") from exc
+    if not source.is_file():
+        raise Step04Error(
+            f"input fingerprint JSON does not exist: {source}"
+        )
+
+    try:
+        with source.open("r", encoding="utf-8") as stream:
+            document = json.load(stream)
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        raise Step04Error(
+            f"Could not read input fingerprint JSON '{source}': {exc}"
+        ) from exc
+
+    root = _require_fingerprint_mapping(document, "document")
+    schema = _require_fingerprint_string(root.get("schema"), "schema")
+    if schema != RTS_INPUT_FINGERPRINT_SCHEMA:
+        raise Step04Error("unsupported input fingerprint schema.")
+
+    schema_version = _require_fingerprint_int(
+        root.get("schema_version"), "schema_version", minimum=1
+    )
+    if schema_version != RTS_INPUT_FINGERPRINT_SCHEMA_VERSION:
+        raise Step04Error("unsupported input fingerprint schema_version.")
+
+    _require_fingerprint_string(
+        root.get("step04_version"), "step04_version"
+    )
+    metadata_path = Path(
+        _require_fingerprint_string(
+            root.get("metadata_path"), "metadata_path"
+        )
+    )
+    algorithm = _require_fingerprint_string(
+        root.get("algorithm"), "algorithm"
+    )
+    if algorithm != "sha256":
+        raise Step04Error("algorithm must be sha256.")
+
+    file_count = _require_fingerprint_int(
+        root.get("file_count"), "file_count"
+    )
+    total_size_bytes = _require_fingerprint_int(
+        root.get("total_size_bytes"), "total_size_bytes"
+    )
+
+    files_value = root.get("files")
+    if not isinstance(files_value, list):
+        raise Step04Error("files must be a JSON array.")
+
+    files: list[RTSInputFileFingerprint] = []
+    seen_paths: set[Path] = set()
+    for expected_index, value in enumerate(files_value):
+        item = _require_fingerprint_mapping(
+            value, f"files[{expected_index}]"
+        )
+        index = _require_fingerprint_int(
+            item.get("index"), f"files[{expected_index}].index"
+        )
+        if index != expected_index:
+            raise Step04Error(
+                "fingerprint file indices must be contiguous and ordered."
+            )
+
+        filepath = Path(
+            _require_fingerprint_string(
+                item.get("path"), f"files[{expected_index}].path"
+            )
+        )
+        normalized = _normalized_artifact_path(filepath)
+        if normalized in seen_paths:
+            raise Step04Error(
+                "fingerprint file paths must be unique."
+            )
+        seen_paths.add(normalized)
+
+        size_bytes = _require_fingerprint_int(
+            item.get("size_bytes"),
+            f"files[{expected_index}].size_bytes",
+        )
+        sha256 = _require_fingerprint_string(
+            item.get("sha256"), f"files[{expected_index}].sha256"
+        )
+        if len(sha256) != 64:
+            raise Step04Error(
+                f"files[{expected_index}].sha256 must contain 64 "
+                "hexadecimal characters."
+            )
+        if sha256 != sha256.lower() or any(
+            character not in "0123456789abcdef" for character in sha256
+        ):
+            raise Step04Error(
+                f"files[{expected_index}].sha256 must be lowercase "
+                "hexadecimal."
+            )
+
+        files.append(
+            RTSInputFileFingerprint(
+                index=index,
+                path=normalized,
+                size_bytes=size_bytes,
+                sha256=sha256,
+            )
+        )
+
+    if len(files) != file_count:
+        raise Step04Error("files length must match file_count.")
+    if sum(item.size_bytes for item in files) != total_size_bytes:
+        raise Step04Error(
+            "file sizes must sum to total_size_bytes."
+        )
+
+    return RTSInputFileFingerprintSet(
+        metadata_path=metadata_path,
+        algorithm=algorithm,
+        files=tuple(files),
     )
 
 
