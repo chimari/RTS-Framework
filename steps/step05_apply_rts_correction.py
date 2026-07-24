@@ -1,7 +1,7 @@
 """Step 05: prepare deterministic RTS correction plans.
 
-Version 5.5.0 adds a deterministic command-line interface that runs the
-complete Step 05 correction pipeline and writes a verified FITS artifact.
+Version 5.6.0 adds deterministic batch correction for multiple FITS inputs
+using one validated RTS dictionary metadata artifact.
 """
 
 from __future__ import annotations
@@ -32,7 +32,7 @@ from steps.step04_prepare_rts_dictionary_analysis import (
     validate_rts_dictionary_artifacts,
 )
 
-__version__ = "5.5.0"
+__version__ = "5.6.0"
 
 __all__ = [
     "RTSCandidateClassification",
@@ -43,6 +43,8 @@ __all__ = [
     "RTSCorrectionDecision",
     "RTSCorrectionDecisionReason",
     "RTSCorrectionDecisionResult",
+    "RTSCorrectionBatchItem",
+    "RTSCorrectionBatchResult",
     "RTSCorrectionOutput",
     "RTSCorrectionPlan",
     "Step05Error",
@@ -50,6 +52,7 @@ __all__ = [
     "build_rts_correction_decisions",
     "classify_rts_correction_candidates",
     "prepare_rts_correction",
+    "run_rts_correction_batch",
     "run_rts_correction_cli",
     "write_rts_corrected_fits",
 ]
@@ -408,6 +411,114 @@ class RTSCorrectionApplicationResult:
             "preserved_count": self.preserved_count,
         }
 
+
+
+
+@dataclass(slots=True, frozen=True)
+class RTSCorrectionBatchItem:
+    """Immutable result for one input in a batch correction run."""
+
+    input_path: Path
+    output_path: Path
+    succeeded: bool
+    output: RTSCorrectionOutput | None = None
+    error: str | None = None
+
+    def __post_init__(self) -> None:
+        input_path = Path(self.input_path).expanduser().resolve()
+        output_path = Path(self.output_path).expanduser().resolve()
+        object.__setattr__(self, "input_path", input_path)
+        object.__setattr__(self, "output_path", output_path)
+
+        if self.succeeded:
+            if self.output is None:
+                raise Step05Error(
+                    "successful batch items require an output result."
+                )
+            if self.error is not None:
+                raise Step05Error(
+                    "successful batch items must not contain an error."
+                )
+            if self.output.input_path != input_path:
+                raise Step05Error(
+                    "batch item input_path does not match output result."
+                )
+            if self.output.output_path != output_path:
+                raise Step05Error(
+                    "batch item output_path does not match output result."
+                )
+        else:
+            if self.output is not None:
+                raise Step05Error(
+                    "failed batch items must not contain an output result."
+                )
+            if not self.error:
+                raise Step05Error(
+                    "failed batch items require a non-empty error."
+                )
+
+    def summary(self) -> dict[str, object]:
+        """Return one deterministic JSON-serializable item summary."""
+        payload: dict[str, object] = {
+            "input_path": str(self.input_path),
+            "output_path": str(self.output_path),
+            "succeeded": self.succeeded,
+        }
+        if self.output is not None:
+            payload["output"] = self.output.summary()
+        if self.error is not None:
+            payload["error"] = self.error
+        return payload
+
+
+@dataclass(slots=True, frozen=True)
+class RTSCorrectionBatchResult:
+    """Immutable aggregate result for one batch correction run."""
+
+    metadata_path: Path
+    output_directory: Path
+    items: tuple[RTSCorrectionBatchItem, ...]
+    continue_on_error: bool
+    overwrite: bool
+
+    def __post_init__(self) -> None:
+        metadata_path = Path(self.metadata_path).expanduser().resolve()
+        output_directory = Path(self.output_directory).expanduser().resolve()
+        object.__setattr__(self, "metadata_path", metadata_path)
+        object.__setattr__(self, "output_directory", output_directory)
+        if not self.items:
+            raise Step05Error("batch result must contain at least one item.")
+
+    @property
+    def total_count(self) -> int:
+        return len(self.items)
+
+    @property
+    def succeeded_count(self) -> int:
+        return sum(1 for item in self.items if item.succeeded)
+
+    @property
+    def failed_count(self) -> int:
+        return self.total_count - self.succeeded_count
+
+    @property
+    def all_succeeded(self) -> bool:
+        return self.failed_count == 0
+
+    def summary(self) -> dict[str, object]:
+        """Return one deterministic JSON-serializable batch summary."""
+        return {
+            "step05_version": __version__,
+            "metadata_path": str(self.metadata_path),
+            "output_directory": str(self.output_directory),
+            "continue_on_error": self.continue_on_error,
+            "overwrite": self.overwrite,
+            "total_count": self.total_count,
+            "succeeded_count": self.succeeded_count,
+            "failed_count": self.failed_count,
+            "all_succeeded": self.all_succeeded,
+            "items": tuple(item.summary() for item in self.items),
+        }
 
 
 @dataclass(slots=True, frozen=True)
@@ -1130,6 +1241,111 @@ def write_rts_corrected_fits(
         image_shape=application_result.plan.image_shape,
         pixel_dtype=application_result.output_dtype,
         history_entries=history_entries,
+    )
+
+
+
+
+def run_rts_correction_batch(
+    metadata_path: str | Path,
+    input_paths: list[str | Path] | tuple[str | Path, ...],
+    output_directory: str | Path,
+    *,
+    output_suffix: str = "_rts_corrected",
+    state_tolerance_fraction: float = 0.25,
+    overwrite: bool = False,
+    continue_on_error: bool = False,
+) -> RTSCorrectionBatchResult:
+    """Correct multiple FITS inputs using one RTS dictionary metadata file.
+
+    Output filenames preserve each input stem and suffix:
+        image.fit -> image_rts_corrected.fit
+
+    When continue_on_error is False, the first failure raises Step05Error.
+    When True, failures are recorded and subsequent inputs continue.
+    """
+    metadata = Path(metadata_path).expanduser().resolve()
+    destination_dir = Path(output_directory).expanduser().resolve()
+
+    if not isinstance(input_paths, (list, tuple)) or not input_paths:
+        raise Step05Error("input_paths must be a non-empty list or tuple.")
+    if not isinstance(output_suffix, str) or not output_suffix:
+        raise Step05Error("output_suffix must be a non-empty string.")
+    if "/" in output_suffix or "\\" in output_suffix:
+        raise Step05Error("output_suffix must not contain path separators.")
+    if not isinstance(overwrite, bool):
+        raise Step05Error("overwrite must be a bool.")
+    if not isinstance(continue_on_error, bool):
+        raise Step05Error("continue_on_error must be a bool.")
+    if not destination_dir.exists():
+        raise Step05Error(
+            f"output directory does not exist: '{destination_dir}'."
+        )
+    if not destination_dir.is_dir():
+        raise Step05Error(
+            f"output path is not a directory: '{destination_dir}'."
+        )
+
+    normalized_inputs = tuple(
+        Path(path).expanduser().resolve() for path in input_paths
+    )
+    if len(set(normalized_inputs)) != len(normalized_inputs):
+        raise Step05Error("input_paths contains duplicate paths.")
+
+    items: list[RTSCorrectionBatchItem] = []
+    used_outputs: set[Path] = set()
+
+    for input_path in normalized_inputs:
+        output_name = (
+            f"{input_path.stem}{output_suffix}{input_path.suffix}"
+        )
+        output_path = destination_dir / output_name
+
+        if output_path in used_outputs:
+            raise Step05Error(
+                f"multiple inputs map to the same output: '{output_path}'."
+            )
+        used_outputs.add(output_path)
+
+        try:
+            plan = prepare_rts_correction(metadata, input_path)
+            classification = classify_rts_correction_candidates(
+                plan,
+                state_tolerance_fraction=state_tolerance_fraction,
+            )
+            decisions = build_rts_correction_decisions(classification)
+            application = apply_rts_correction_in_memory(decisions)
+            output = write_rts_corrected_fits(
+                application,
+                output_path,
+                overwrite=overwrite,
+            )
+            items.append(
+                RTSCorrectionBatchItem(
+                    input_path=input_path,
+                    output_path=output_path,
+                    succeeded=True,
+                    output=output,
+                )
+            )
+        except Step05Error as exc:
+            if not continue_on_error:
+                raise
+            items.append(
+                RTSCorrectionBatchItem(
+                    input_path=input_path,
+                    output_path=output_path,
+                    succeeded=False,
+                    error=str(exc),
+                )
+            )
+
+    return RTSCorrectionBatchResult(
+        metadata_path=metadata,
+        output_directory=destination_dir,
+        items=tuple(items),
+        continue_on_error=continue_on_error,
+        overwrite=overwrite,
     )
 
 
