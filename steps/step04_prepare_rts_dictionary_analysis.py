@@ -1,7 +1,7 @@
 """Step 04: prepare an RTS dictionary analysis plan.
 
-Version 4.19.0 adds cooperative cancellation to the high-level dictionary
-build APIs while preserving atomic output and existing analysis behavior.
+Version 4.20.0 adds immutable structured cancellation information while
+preserving cooperative cancellation and existing analysis behavior.
 """
 
 from __future__ import annotations
@@ -13,7 +13,7 @@ import csv
 import os
 import tempfile
 
-__version__ = "4.19.0"
+__version__ = "4.20.0"
 
 from dataclasses import dataclass
 
@@ -32,6 +32,7 @@ __all__ = [
     "RTSCandidateResult",
     "RTSDictionaryBuildResult",
     "RTSProgressState",
+    "RTSCancellationInfo",
     "Step04Cancelled",
     "RTSDictionaryPlan",
     "RTSPixelAnalysisResult",
@@ -67,6 +68,15 @@ class Step04Error(Exception):
 
 class Step04Cancelled(Step04Error):
     """Raised when cooperative Step 04 cancellation is requested."""
+
+    def __init__(self, info: "RTSCancellationInfo") -> None:
+        if not isinstance(info, RTSCancellationInfo):
+            raise TypeError("info must be an RTSCancellationInfo.")
+        self.info = info
+        super().__init__(
+            "RTS dictionary build cancelled after "
+            f"{info.completed_pixel_count} completed pixels."
+        )
 
 
 
@@ -329,6 +339,60 @@ class PixelTimeSeries:
 
 
 
+
+
+
+@dataclass(slots=True, frozen=True)
+class RTSCancellationInfo:
+    """Immutable context describing one cancelled dictionary build."""
+
+    completed_pixel_count: int
+    total_pixel_count: int
+    output_path: Path
+
+    def __post_init__(self) -> None:
+        if isinstance(self.completed_pixel_count, bool) or not isinstance(
+            self.completed_pixel_count, int
+        ):
+            raise Step04Error("completed_pixel_count must be an integer.")
+        if isinstance(self.total_pixel_count, bool) or not isinstance(
+            self.total_pixel_count, int
+        ):
+            raise Step04Error("total_pixel_count must be an integer.")
+        if self.completed_pixel_count < 0:
+            raise Step04Error("completed_pixel_count must be non-negative.")
+        if self.total_pixel_count < 0:
+            raise Step04Error("total_pixel_count must be non-negative.")
+        if self.completed_pixel_count > self.total_pixel_count:
+            raise Step04Error(
+                "completed_pixel_count must not exceed total_pixel_count."
+            )
+        if not isinstance(self.output_path, Path):
+            raise Step04Error("output_path must be a pathlib.Path.")
+
+    @property
+    def remaining_pixel_count(self) -> int:
+        return self.total_pixel_count - self.completed_pixel_count
+
+    @property
+    def fraction_complete(self) -> float:
+        if self.total_pixel_count == 0:
+            return 1.0
+        return self.completed_pixel_count / self.total_pixel_count
+
+    @property
+    def percent_complete(self) -> float:
+        return 100.0 * self.fraction_complete
+
+    def summary(self) -> dict[str, object]:
+        return {
+            "completed_pixel_count": self.completed_pixel_count,
+            "total_pixel_count": self.total_pixel_count,
+            "remaining_pixel_count": self.remaining_pixel_count,
+            "fraction_complete": self.fraction_complete,
+            "percent_complete": self.percent_complete,
+            "output_path": str(self.output_path),
+        }
 
 
 @dataclass(slots=True, frozen=True)
@@ -751,6 +815,16 @@ def build_rts_dictionary_csv_result(
     if cancel_requested is not None and not callable(cancel_requested):
         raise Step04Error("cancel_requested must be callable or None.")
 
+    try:
+        resolved_output_path = Path(output_path)
+    except TypeError as exc:
+        raise Step04Error("output_path must be path-like.") from exc
+
+    total_pixel_count = (
+        (resolved_row_stop - resolved_row_start)
+        * (resolved_column_stop - resolved_column_start)
+    )
+
     def check_cancellation(completed: int) -> None:
         if cancel_requested is None:
             return
@@ -764,14 +838,12 @@ def build_rts_dictionary_csv_result(
             raise Step04Error("cancel_requested must return bool.")
         if requested:
             raise Step04Cancelled(
-                f"RTS dictionary build cancelled after "
-                f"{completed} completed pixels."
+                RTSCancellationInfo(
+                    completed_pixel_count=completed,
+                    total_pixel_count=total_pixel_count,
+                    output_path=resolved_output_path,
+                )
             )
-
-    total_pixel_count = (
-        (resolved_row_stop - resolved_row_start)
-        * (resolved_column_stop - resolved_column_start)
-    )
 
     def notify_progress(completed: int) -> None:
         if progress_callback is None:
