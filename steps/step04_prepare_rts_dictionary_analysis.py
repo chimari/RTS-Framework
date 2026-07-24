@@ -1,12 +1,12 @@
 """Step 04: prepare an RTS dictionary analysis plan.
 
-Version 4.4.0 adds deterministic RTS-candidate classification from a
-TwoStateScoreResult using explicit score, occupancy, and separation thresholds.
+Version 4.5.0 adds deterministic temporal transition analysis for one
+PixelTimeSeries using the two fitted state centers from TwoStateScoreResult.
 """
 
 from __future__ import annotations
 
-__version__ = "4.4.0"
+__version__ = "4.5.0"
 
 from dataclasses import dataclass
 
@@ -26,6 +26,8 @@ __all__ = [
     "RTSDictionaryPlan",
     "Step04Error",
     "TwoStateScoreResult",
+    "TwoStateTransitionResult",
+    "analyze_two_state_transitions",
     "classify_rts_candidate",
     "compute_pixel_timeseries_statistics",
     "compute_two_state_score",
@@ -40,6 +42,40 @@ class Step04Error(Exception):
 
 
 
+
+
+
+@dataclass(slots=True, frozen=True)
+class TwoStateTransitionResult:
+    """Immutable temporal transition analysis for one fitted two-state series."""
+
+    series: "PixelTimeSeries"
+    score_result: "TwoStateScoreResult"
+    state_sequence: tuple[str, ...]
+    lower_state_count: int
+    upper_state_count: int
+    transition_count: int
+    lower_to_upper_count: int
+    upper_to_lower_count: int
+    longest_lower_run: int
+    longest_upper_run: int
+
+    def summary(self) -> dict[str, object]:
+        """Return a canonical JSON-serializable transition summary."""
+        return {
+            "dataset": self.series.dataset,
+            "row": self.series.row,
+            "column": self.series.column,
+            "n_frames": self.series.n_frames,
+            "lower_state_count": self.lower_state_count,
+            "upper_state_count": self.upper_state_count,
+            "transition_count": self.transition_count,
+            "lower_to_upper_count": self.lower_to_upper_count,
+            "upper_to_lower_count": self.upper_to_lower_count,
+            "longest_lower_run": self.longest_lower_run,
+            "longest_upper_run": self.longest_upper_run,
+            "state_sequence": list(self.state_sequence),
+        }
 
 
 @dataclass(slots=True, frozen=True)
@@ -205,6 +241,137 @@ class RTSDictionaryPlan:
 
 
 
+
+
+def analyze_two_state_transitions(
+    series: PixelTimeSeries,
+    score_result: TwoStateScoreResult,
+) -> TwoStateTransitionResult:
+    """Assign each frame to the nearest fitted state center and count transitions.
+
+    Each value is assigned to either the lower or upper fitted state center.
+    Exact midpoint ties are assigned to the lower state, providing a fixed and
+    deterministic rule.
+
+    The original frame order is preserved. The function reports total
+    transitions, directional transitions, state occupancies, and the longest
+    consecutive run in each state.
+
+    This function does not apply candidate thresholds, minimum dwell-time
+    requirements, transition-rate criteria, or read-noise significance tests.
+
+    Parameters
+    ----------
+    series
+        Pixel time series returned by :func:`load_pixel_timeseries`.
+    score_result
+        Two-state fit returned by :func:`compute_two_state_score` for the same
+        exact PixelTimeSeries object.
+
+    Returns
+    -------
+    TwoStateTransitionResult
+        Immutable temporal state analysis.
+
+    Raises
+    ------
+    Step04Error
+        If either input is invalid, if they do not refer to the same source
+        series, or if the series data are inconsistent or non-finite.
+    """
+    if not isinstance(series, PixelTimeSeries):
+        raise Step04Error(
+            "series must be a PixelTimeSeries returned by "
+            "load_pixel_timeseries()."
+        )
+    if not isinstance(score_result, TwoStateScoreResult):
+        raise Step04Error(
+            "score_result must be a TwoStateScoreResult returned by "
+            "compute_two_state_score()."
+        )
+    if score_result.series is not series:
+        raise Step04Error(
+            "score_result must have been computed from the same "
+            "PixelTimeSeries object."
+        )
+
+    values = series.values
+    if values.ndim != 1:
+        raise Step04Error("Pixel time-series values must be one-dimensional.")
+    if values.size == 0:
+        raise Step04Error("Pixel time-series values must not be empty.")
+    if values.size != series.n_frames:
+        raise Step04Error(
+            f"Pixel time series contains {values.size} value(s); "
+            f"metadata requires {series.n_frames}."
+        )
+    if score_result.n_frames != series.n_frames:
+        raise Step04Error(
+            "score_result frame count does not match the pixel time series."
+        )
+    if not np.all(np.isfinite(values)):
+        raise Step04Error("Pixel time-series values must all be finite.")
+
+    lower_center = score_result.lower_state_center
+    upper_center = score_result.upper_state_center
+    if not np.isfinite(lower_center) or not np.isfinite(upper_center):
+        raise Step04Error("State centers must be finite.")
+    if upper_center < lower_center:
+        raise Step04Error(
+            "upper_state_center must be greater than or equal to "
+            "lower_state_center."
+        )
+
+    midpoint = (lower_center + upper_center) / 2.0
+    labels = tuple(
+        "lower" if float(value) <= midpoint else "upper"
+        for value in values
+    )
+
+    lower_state_count = labels.count("lower")
+    upper_state_count = labels.count("upper")
+
+    transition_count = 0
+    lower_to_upper_count = 0
+    upper_to_lower_count = 0
+    longest_lower_run = 0
+    longest_upper_run = 0
+    current_label = labels[0]
+    current_run = 1
+
+    for previous, current in zip(labels, labels[1:]):
+        if current == previous:
+            current_run += 1
+            continue
+
+        if previous == "lower":
+            longest_lower_run = max(longest_lower_run, current_run)
+            lower_to_upper_count += 1
+        else:
+            longest_upper_run = max(longest_upper_run, current_run)
+            upper_to_lower_count += 1
+
+        transition_count += 1
+        current_label = current
+        current_run = 1
+
+    if current_label == "lower":
+        longest_lower_run = max(longest_lower_run, current_run)
+    else:
+        longest_upper_run = max(longest_upper_run, current_run)
+
+    return TwoStateTransitionResult(
+        series=series,
+        score_result=score_result,
+        state_sequence=labels,
+        lower_state_count=lower_state_count,
+        upper_state_count=upper_state_count,
+        transition_count=transition_count,
+        lower_to_upper_count=lower_to_upper_count,
+        upper_to_lower_count=upper_to_lower_count,
+        longest_lower_run=longest_lower_run,
+        longest_upper_run=longest_upper_run,
+    )
 
 def classify_rts_candidate(
     score_result: TwoStateScoreResult,
