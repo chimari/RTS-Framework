@@ -1,7 +1,7 @@
 """Step 04: prepare an RTS dictionary analysis plan.
 
-Version 4.30.0 adds deterministic atomic JSON persistence and validated
-loading for input-file comparison reports while preserving existing APIs.
+Version 4.31.0 adds a high-level deterministic input-file audit workflow
+while preserving all existing public APIs.
 """
 
 from __future__ import annotations
@@ -15,7 +15,7 @@ import json
 import os
 import tempfile
 
-__version__ = "4.30.0"
+__version__ = "4.31.0"
 
 from dataclasses import dataclass
 
@@ -80,6 +80,8 @@ __all__ = [
     "compare_rts_input_file_fingerprints",
     "write_rts_input_file_comparison_json",
     "load_rts_input_file_comparison_json",
+    "RTSInputAuditResult",
+    "audit_rts_dictionary_input_files",
     "build_rts_dictionary_artifacts",
     "build_rts_dictionary_csv",
     "build_rts_dictionary_csv_result",
@@ -2159,6 +2161,146 @@ def compare_rts_input_file_fingerprints(
     )
 
 
+
+
+
+@dataclass(frozen=True, slots=True)
+class RTSInputAuditResult:
+    """Complete deterministic result of one Step 04 input-file audit."""
+
+    metadata_path: Path
+    fingerprint_json_path: Path
+    comparison_json_path: Path
+    fingerprints: RTSInputFileFingerprintSet
+    comparison: RTSInputFileFingerprintComparison
+
+    def __post_init__(self) -> None:
+        metadata_path = Path(self.metadata_path)
+        fingerprint_json_path = Path(self.fingerprint_json_path)
+        comparison_json_path = Path(self.comparison_json_path)
+
+        if not isinstance(
+            self.fingerprints, RTSInputFileFingerprintSet
+        ):
+            raise Step04Error(
+                "fingerprints must be an RTSInputFileFingerprintSet."
+            )
+        if not isinstance(
+            self.comparison, RTSInputFileFingerprintComparison
+        ):
+            raise Step04Error(
+                "comparison must be an RTSInputFileFingerprintComparison."
+            )
+        if self.fingerprints.metadata_path != metadata_path:
+            raise Step04Error(
+                "fingerprints.metadata_path must match metadata_path."
+            )
+        if self.comparison.metadata_path != metadata_path:
+            raise Step04Error(
+                "comparison.metadata_path must match metadata_path."
+            )
+        if (
+            self.fingerprints.algorithm
+            != self.comparison.algorithm
+        ):
+            raise Step04Error(
+                "fingerprint and comparison algorithms must match."
+            )
+
+        object.__setattr__(self, "metadata_path", metadata_path)
+        object.__setattr__(
+            self, "fingerprint_json_path", fingerprint_json_path
+        )
+        object.__setattr__(
+            self, "comparison_json_path", comparison_json_path
+        )
+
+    @property
+    def matches(self) -> bool:
+        """Return True when all expected inputs still match exactly."""
+        return self.comparison.matches
+
+    def summary(self) -> dict:
+        """Return a deterministic JSON-compatible audit summary."""
+        return {
+            "metadata_path": _normalized_artifact_path(
+                self.metadata_path
+            ),
+            "fingerprint_json_path": _normalized_artifact_path(
+                self.fingerprint_json_path
+            ),
+            "comparison_json_path": _normalized_artifact_path(
+                self.comparison_json_path
+            ),
+            "matches": self.matches,
+            "fingerprint_file_count": self.fingerprints.file_count,
+            "comparison": self.comparison.summary(),
+        }
+
+
+def audit_rts_dictionary_input_files(
+    metadata,
+    *,
+    fingerprint_json_path=None,
+    comparison_json_path=None,
+) -> RTSInputAuditResult:
+    """Create or reuse a baseline fingerprint set, then audit current files.
+
+    If the fingerprint JSON does not exist, the current inputs are
+    fingerprinted and saved as the baseline. If it already exists, that
+    saved baseline is loaded and compared with the current files.
+    """
+    if isinstance(metadata, RTSDictionaryMetadata):
+        metadata_path = metadata.metadata_path
+    else:
+        try:
+            metadata_path = Path(metadata)
+        except TypeError as exc:
+            raise Step04Error(
+                "metadata must be a metadata path or RTSDictionaryMetadata."
+            ) from exc
+
+    if fingerprint_json_path is None:
+        requested_fingerprint_path = _default_fingerprint_json_path(
+            metadata_path
+        )
+    else:
+        try:
+            requested_fingerprint_path = Path(fingerprint_json_path)
+        except TypeError as exc:
+            raise Step04Error(
+                "fingerprint_json_path must be path-like or None."
+            ) from exc
+
+    if requested_fingerprint_path.is_file():
+        fingerprints = load_rts_input_file_fingerprints_json(
+            requested_fingerprint_path
+        )
+        if fingerprints.metadata_path != metadata_path:
+            raise Step04Error(
+                "saved fingerprints metadata_path does not match metadata."
+            )
+        written_fingerprint_path = requested_fingerprint_path
+    else:
+        fingerprints = fingerprint_rts_dictionary_input_files(metadata)
+        written_fingerprint_path = write_rts_input_file_fingerprints_json(
+            fingerprints,
+            requested_fingerprint_path,
+        )
+
+    comparison = compare_rts_input_file_fingerprints(fingerprints)
+    written_comparison_path = write_rts_input_file_comparison_json(
+        comparison,
+        comparison_json_path,
+    )
+
+    return RTSInputAuditResult(
+        metadata_path=fingerprints.metadata_path,
+        fingerprint_json_path=written_fingerprint_path,
+        comparison_json_path=written_comparison_path,
+        fingerprints=fingerprints,
+        comparison=comparison,
+    )
 
 
 RTS_INPUT_COMPARISON_SCHEMA = (
