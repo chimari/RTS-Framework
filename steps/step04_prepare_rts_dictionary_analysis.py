@@ -1,7 +1,7 @@
 """Step 04: prepare an RTS dictionary analysis plan.
 
-Version 4.26.0 adds validated input-file inventory checks for RTS
-dictionary metadata while preserving all existing public APIs.
+Version 4.27.0 adds deterministic SHA-256 input-file fingerprints for
+RTS dictionary metadata while preserving all existing public APIs.
 """
 
 from __future__ import annotations
@@ -10,11 +10,12 @@ from pathlib import Path
 from time import monotonic
 
 import csv
+import hashlib
 import json
 import os
 import tempfile
 
-__version__ = "4.26.0"
+__version__ = "4.27.0"
 
 from dataclasses import dataclass
 
@@ -38,6 +39,8 @@ __all__ = [
     "RTSDictionaryCSV",
     "RTSDictionaryArtifacts",
     "RTSInputFileValidation",
+    "RTSInputFileFingerprint",
+    "RTSInputFileFingerprintSet",
     "RTSProgressState",
     "RTSCancellationInfo",
     "RTSDictionaryBuildParameters",
@@ -69,6 +72,7 @@ __all__ = [
     "load_rts_dictionary_csv",
     "load_rts_dictionary_artifacts",
     "validate_rts_dictionary_input_files",
+    "fingerprint_rts_dictionary_input_files",
     "build_rts_dictionary_artifacts",
     "build_rts_dictionary_csv",
     "build_rts_dictionary_csv_result",
@@ -640,6 +644,55 @@ class RTSDictionaryArtifacts:
             "metadata": self.metadata.summary(),
         }
 
+
+
+
+@dataclass(slots=True, frozen=True)
+class RTSInputFileFingerprint:
+    """Immutable deterministic fingerprint for one metadata input file."""
+
+    index: int
+    path: Path
+    size_bytes: int
+    sha256: str
+
+    def summary(self) -> dict[str, object]:
+        """Return a deterministic JSON-serializable fingerprint summary."""
+        return {
+            "index": self.index,
+            "path": str(self.path),
+            "size_bytes": self.size_bytes,
+            "sha256": self.sha256,
+        }
+
+
+@dataclass(slots=True, frozen=True)
+class RTSInputFileFingerprintSet:
+    """Immutable ordered fingerprint inventory for all input files."""
+
+    metadata_path: Path
+    algorithm: str
+    files: tuple[RTSInputFileFingerprint, ...]
+
+    @property
+    def file_count(self) -> int:
+        """Return the number of fingerprinted files."""
+        return len(self.files)
+
+    @property
+    def total_size_bytes(self) -> int:
+        """Return the sum of all fingerprinted file sizes."""
+        return sum(item.size_bytes for item in self.files)
+
+    def summary(self) -> dict[str, object]:
+        """Return a deterministic JSON-serializable inventory summary."""
+        return {
+            "metadata_path": str(self.metadata_path),
+            "algorithm": self.algorithm,
+            "file_count": self.file_count,
+            "total_size_bytes": self.total_size_bytes,
+            "files": tuple(item.summary() for item in self.files),
+        }
 
 
 @dataclass(slots=True, frozen=True)
@@ -1632,6 +1685,66 @@ def validate_rts_dictionary_input_files(
         metadata_path=loaded.metadata_path,
         expected_file_count=loaded.n_frames,
         validated_filepaths=tuple(normalized_paths),
+    )
+
+
+
+
+def _sha256_file(path: Path, *, chunk_size: int = 1024 * 1024) -> str:
+    """Return the lowercase hexadecimal SHA-256 digest for one file."""
+    digest = hashlib.sha256()
+    try:
+        with path.open("rb") as stream:
+            while True:
+                chunk = stream.read(chunk_size)
+                if not chunk:
+                    break
+                digest.update(chunk)
+    except OSError as exc:
+        raise Step04Error(
+            f"Could not fingerprint input file '{path}': {exc}"
+        ) from exc
+    return digest.hexdigest()
+
+
+def fingerprint_rts_dictionary_input_files(
+    metadata,
+) -> RTSInputFileFingerprintSet:
+    """Validate and fingerprint every input file recorded in metadata.
+
+    ``metadata`` may be an :class:`RTSDictionaryMetadata` instance or a
+    metadata JSON path. Files are first validated with
+    :func:`validate_rts_dictionary_input_files`, then processed in metadata
+    order using SHA-256. The returned inventory is deterministic and immutable.
+    """
+    if isinstance(metadata, RTSDictionaryMetadata):
+        loaded = metadata
+    else:
+        loaded = load_rts_dictionary_metadata_json(metadata)
+
+    validation = validate_rts_dictionary_input_files(loaded)
+
+    fingerprints: list[RTSInputFileFingerprint] = []
+    for index, path in enumerate(validation.validated_filepaths):
+        try:
+            size_bytes = path.stat().st_size
+        except OSError as exc:
+            raise Step04Error(
+                f"Could not stat input file '{path}': {exc}"
+            ) from exc
+        fingerprints.append(
+            RTSInputFileFingerprint(
+                index=index,
+                path=path,
+                size_bytes=size_bytes,
+                sha256=_sha256_file(path),
+            )
+        )
+
+    return RTSInputFileFingerprintSet(
+        metadata_path=loaded.metadata_path,
+        algorithm="sha256",
+        files=tuple(fingerprints),
     )
 
 
