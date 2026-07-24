@@ -1,6 +1,6 @@
 """Step 04: prepare an RTS dictionary analysis plan.
 
-Version 4.32.0 adds deterministic audit-status evaluation for CLI and CI
+Version 4.33.0 adds a minimal command-line input-audit interface
 while preserving all existing public APIs.
 """
 
@@ -9,13 +9,15 @@ from __future__ import annotations
 from pathlib import Path
 from time import monotonic
 
+import argparse
 import csv
 import hashlib
 import json
 import os
+import sys
 import tempfile
 
-__version__ = "4.32.0"
+__version__ = "4.33.0"
 
 from dataclasses import dataclass
 from enum import Enum
@@ -86,6 +88,8 @@ __all__ = [
     "RTSAuditStatusName",
     "RTSAuditStatus",
     "evaluate_rts_input_audit",
+    "run_rts_input_audit_cli",
+    "main",
     "build_rts_dictionary_artifacts",
     "build_rts_dictionary_csv",
     "build_rts_dictionary_csv_result",
@@ -4275,3 +4279,122 @@ def _validate_min_frames(value: int) -> int:
     if value < 3:
         raise Step04Error("min_frames must be an integer of at least 3.")
     return value
+
+
+def _build_rts_input_audit_argument_parser():
+    """Return the stable Step 04 input-audit CLI parser."""
+    parser = argparse.ArgumentParser(
+        prog="rts-step04-input-audit",
+        description=(
+            "Audit the input files recorded by a Step 04 RTS dictionary "
+            "metadata artifact."
+        ),
+    )
+    parser.add_argument(
+        "metadata_path",
+        type=Path,
+        help="Path to the Step 04 dictionary metadata JSON.",
+    )
+    parser.add_argument(
+        "--fingerprint-json",
+        dest="fingerprint_json_path",
+        type=Path,
+        default=None,
+        help=(
+            "Optional baseline fingerprint JSON path. The baseline is "
+            "created when this file does not yet exist."
+        ),
+    )
+    parser.add_argument(
+        "--comparison-json",
+        dest="comparison_json_path",
+        type=Path,
+        default=None,
+        help="Optional output path for the comparison JSON.",
+    )
+    parser.add_argument(
+        "--quiet",
+        action="store_true",
+        help="Suppress normal output and communicate only by exit code.",
+    )
+    parser.add_argument(
+        "--version",
+        action="version",
+        version=f"%(prog)s {__version__}",
+    )
+    return parser
+
+
+def _write_rts_input_audit_cli_report(
+    audit: RTSInputAuditResult,
+    status: RTSAuditStatus,
+    stream,
+) -> None:
+    """Write one deterministic human-readable audit report."""
+    print(f"RTS input audit: {status.name.value}", file=stream)
+    print(status.message, file=stream)
+    print(
+        f"Fingerprint JSON : {audit.fingerprint_json_path}",
+        file=stream,
+    )
+    print(
+        f"Comparison JSON  : {audit.comparison_json_path}",
+        file=stream,
+    )
+
+
+def run_rts_input_audit_cli(
+    argv=None,
+    *,
+    stdout=None,
+    stderr=None,
+) -> int:
+    """Run the Step 04 input-audit CLI and return its policy exit code.
+
+    ``argparse`` retains its standard behavior for ``--help``, ``--version``,
+    and invalid arguments: those cases raise ``SystemExit`` with the usual
+    command-line exit code.
+    """
+    parser = _build_rts_input_audit_argument_parser()
+    output_stream = sys.stdout if stdout is None else stdout
+    error_stream = sys.stderr if stderr is None else stderr
+
+    def print_message(message, file=None):
+        if not message:
+            return
+        target = output_stream if file is sys.stdout else error_stream
+        target.write(message)
+
+    parser._print_message = print_message
+    namespace = parser.parse_args(argv)
+
+    try:
+        audit = audit_rts_dictionary_input_files(
+            namespace.metadata_path,
+            fingerprint_json_path=namespace.fingerprint_json_path,
+            comparison_json_path=namespace.comparison_json_path,
+        )
+        status = evaluate_rts_input_audit(audit)
+    except (Step04Error, OSError, ValueError) as exc:
+        if not namespace.quiet:
+            print(f"RTS input audit error: {exc}", file=error_stream)
+        return 64
+
+    if not namespace.quiet:
+        _write_rts_input_audit_cli_report(
+            audit,
+            status,
+            output_stream,
+        )
+
+    return status.exit_code
+
+
+def main(argv=None) -> int:
+    """Command-line entry point for the Step 04 input audit."""
+    return run_rts_input_audit_cli(argv)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
+
