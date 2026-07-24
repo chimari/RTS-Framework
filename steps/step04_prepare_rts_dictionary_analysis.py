@@ -1,13 +1,12 @@
 """Step 04: prepare an RTS dictionary analysis plan.
 
-Version 4.3.0 adds a deterministic two-state score for one pixel time series.
-It exactly searches every non-empty split of the sorted values and compares
-the best two-center residual with the single-center residual.
+Version 4.4.0 adds deterministic RTS-candidate classification from a
+TwoStateScoreResult using explicit score, occupancy, and separation thresholds.
 """
 
 from __future__ import annotations
 
-__version__ = "4.3.0"
+__version__ = "4.4.0"
 
 from dataclasses import dataclass
 
@@ -23,9 +22,11 @@ from steps.step03_prepare_bias_analysis import (
 __all__ = [
     "PixelTimeSeries",
     "PixelTimeSeriesStatistics",
+    "RTSCandidateResult",
     "RTSDictionaryPlan",
     "Step04Error",
     "TwoStateScoreResult",
+    "classify_rts_candidate",
     "compute_pixel_timeseries_statistics",
     "compute_two_state_score",
     "load_pixel_timeseries",
@@ -38,6 +39,55 @@ class Step04Error(Exception):
 
 
 
+
+
+
+@dataclass(slots=True, frozen=True)
+class RTSCandidateResult:
+    """Immutable threshold-based classification of one two-state score."""
+
+    score_result: "TwoStateScoreResult"
+    minimum_score: float
+    minimum_state_count: int
+    minimum_separation: float
+    passes_score: bool
+    passes_state_count: bool
+    passes_separation: bool
+    is_candidate: bool
+
+    @property
+    def failed_conditions(self) -> tuple[str, ...]:
+        """Return failed condition names in canonical order."""
+        failed: list[str] = []
+        if not self.passes_score:
+            failed.append("score")
+        if not self.passes_state_count:
+            failed.append("state_count")
+        if not self.passes_separation:
+            failed.append("separation")
+        return tuple(failed)
+
+    def summary(self) -> dict[str, object]:
+        """Return a canonical JSON-serializable classification summary."""
+        score = self.score_result
+        return {
+            "dataset": score.series.dataset,
+            "row": score.series.row,
+            "column": score.series.column,
+            "n_frames": score.n_frames,
+            "score": score.score,
+            "lower_state_count": score.lower_state_count,
+            "upper_state_count": score.upper_state_count,
+            "state_separation": score.state_separation,
+            "minimum_score": self.minimum_score,
+            "minimum_state_count": self.minimum_state_count,
+            "minimum_separation": self.minimum_separation,
+            "passes_score": self.passes_score,
+            "passes_state_count": self.passes_state_count,
+            "passes_separation": self.passes_separation,
+            "is_candidate": self.is_candidate,
+            "failed_conditions": list(self.failed_conditions),
+        }
 
 
 @dataclass(slots=True, frozen=True)
@@ -154,6 +204,105 @@ class RTSDictionaryPlan:
 
 
 
+
+
+def classify_rts_candidate(
+    score_result: TwoStateScoreResult,
+    *,
+    minimum_score: float,
+    minimum_state_count: int,
+    minimum_separation: float,
+) -> RTSCandidateResult:
+    """Classify one two-state fit using three explicit threshold conditions.
+
+    A result is an RTS candidate only when all of the following are true:
+
+    1. ``score_result.score >= minimum_score``
+    2. both fitted states contain at least ``minimum_state_count`` samples
+    3. ``score_result.state_separation >= minimum_separation``
+
+    Threshold comparisons are inclusive. This function does not inspect the
+    original temporal ordering, dwell times, transition counts, read noise, or
+    neighboring pixels.
+
+    Parameters
+    ----------
+    score_result
+        Result returned by :func:`compute_two_state_score`.
+    minimum_score
+        Inclusive score threshold in the closed interval [0, 1].
+    minimum_state_count
+        Inclusive minimum occupancy required for each fitted state.
+    minimum_separation
+        Inclusive non-negative state-center separation threshold.
+
+    Returns
+    -------
+    RTSCandidateResult
+        Immutable classification result with each condition recorded
+        separately.
+
+    Raises
+    ------
+    Step04Error
+        If the result or any threshold is invalid.
+    """
+    if not isinstance(score_result, TwoStateScoreResult):
+        raise Step04Error(
+            "score_result must be a TwoStateScoreResult returned by "
+            "compute_two_state_score()."
+        )
+
+    if isinstance(minimum_score, bool) or not isinstance(
+        minimum_score, (int, float, np.integer, np.floating)
+    ):
+        raise Step04Error("minimum_score must be a finite number in [0, 1].")
+    minimum_score = float(minimum_score)
+    if not np.isfinite(minimum_score) or not 0.0 <= minimum_score <= 1.0:
+        raise Step04Error("minimum_score must be a finite number in [0, 1].")
+
+    if isinstance(minimum_state_count, bool) or not isinstance(
+        minimum_state_count, (int, np.integer)
+    ):
+        raise Step04Error("minimum_state_count must be an integer >= 1.")
+    minimum_state_count = int(minimum_state_count)
+    if minimum_state_count < 1:
+        raise Step04Error("minimum_state_count must be an integer >= 1.")
+
+    if isinstance(minimum_separation, bool) or not isinstance(
+        minimum_separation, (int, float, np.integer, np.floating)
+    ):
+        raise Step04Error(
+            "minimum_separation must be a finite number >= 0."
+        )
+    minimum_separation = float(minimum_separation)
+    if not np.isfinite(minimum_separation) or minimum_separation < 0.0:
+        raise Step04Error(
+            "minimum_separation must be a finite number >= 0."
+        )
+
+    passes_score = score_result.score >= minimum_score
+    passes_state_count = (
+        score_result.lower_state_count >= minimum_state_count
+        and score_result.upper_state_count >= minimum_state_count
+    )
+    passes_separation = (
+        score_result.state_separation >= minimum_separation
+    )
+    is_candidate = (
+        passes_score and passes_state_count and passes_separation
+    )
+
+    return RTSCandidateResult(
+        score_result=score_result,
+        minimum_score=minimum_score,
+        minimum_state_count=minimum_state_count,
+        minimum_separation=minimum_separation,
+        passes_score=passes_score,
+        passes_state_count=passes_state_count,
+        passes_separation=passes_separation,
+        is_candidate=is_candidate,
+    )
 
 def compute_two_state_score(
     series: PixelTimeSeries,
