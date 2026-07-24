@@ -7,7 +7,7 @@ No image pixels are read in this step.
 
 from __future__ import annotations
 
-__version__ = "2.1.0"
+__version__ = "2.2.0"
 
 import argparse
 from dataclasses import dataclass
@@ -277,6 +277,59 @@ def _require_single_value(
 
 
 
+
+@dataclass(slots=True, frozen=True)
+class FrameStatistics:
+    """Basic statistics for one image frame."""
+
+    dataset: str
+    frame_index: int
+    filepath: Path
+    temperature_C: float
+    exposure_s: float
+    finite_pixels: int
+    total_pixels: int
+    minimum: float
+    maximum: float
+    mean: float
+    median: float
+    stddev: float
+
+
+@dataclass(slots=True, frozen=True)
+class DatasetStatistics:
+    """Collection of per-frame statistics for one dataset."""
+
+    dataset: str
+    frames: tuple[FrameStatistics, ...]
+
+    @property
+    def n_frames(self) -> int:
+        return len(self.frames)
+
+    @property
+    def frame_mean_min(self) -> float:
+        return min(frame.mean for frame in self.frames)
+
+    @property
+    def frame_mean_max(self) -> float:
+        return max(frame.mean for frame in self.frames)
+
+    @property
+    def frame_median_min(self) -> float:
+        return min(frame.median for frame in self.frames)
+
+    @property
+    def frame_median_max(self) -> float:
+        return max(frame.median for frame in self.frames)
+
+    def summary_line(self) -> str:
+        return (
+            f"{self.dataset}: frames={self.n_frames}, "
+            f"mean={self.frame_mean_min:g}..{self.frame_mean_max:g}, "
+            f"median={self.frame_median_min:g}..{self.frame_median_max:g}"
+        )
+
 ImageProgressCallback = Callable[[int, int, FrameRecord], None]
 
 
@@ -329,6 +382,71 @@ def iter_dataset_images(
         yield frame, image
 
 
+
+def compute_dataset_statistics(
+    group: DatasetGroup,
+    *,
+    progress: ImageProgressCallback | None = None,
+) -> DatasetStatistics:
+    """Compute basic statistics for each frame in a dataset.
+
+    Frames are read lazily using :func:`iter_dataset_images`. Only the current
+    image and the compact statistics records are retained.
+
+    Non-finite floating-point pixels are excluded from all statistics. Integer
+    images are treated as fully finite.
+
+    Raises
+    ------
+    Step02Error
+        If a frame cannot be read, its metadata no longer matches, or it
+        contains no finite pixels.
+    """
+    records: list[FrameStatistics] = []
+
+    for frame, image in iter_dataset_images(group, progress=progress):
+        total_pixels = int(image.size)
+
+        if np.issubdtype(image.dtype, np.inexact):
+            finite_mask = np.isfinite(image)
+            finite_pixels = int(np.count_nonzero(finite_mask))
+            if finite_pixels == 0:
+                raise Step02Error(
+                    "Image contains no finite pixels: "
+                    f"dataset={group.name!r}, "
+                    f"frame_index={frame.frame_index}, "
+                    f"filepath={frame.filepath}."
+                )
+            values = image[finite_mask]
+        else:
+            finite_pixels = total_pixels
+            values = image
+
+        records.append(
+            FrameStatistics(
+                dataset=group.name,
+                frame_index=frame.frame_index,
+                filepath=frame.filepath,
+                temperature_C=frame.temperature_C,
+                exposure_s=frame.exposure_s,
+                finite_pixels=finite_pixels,
+                total_pixels=total_pixels,
+                minimum=float(np.min(values)),
+                maximum=float(np.max(values)),
+                mean=float(np.mean(values, dtype=np.float64)),
+                median=float(np.median(values)),
+                stddev=float(np.std(values, dtype=np.float64)),
+            )
+        )
+
+    if not records:
+        raise Step02Error(f"Dataset {group.name!r} contains no frames.")
+
+    return DatasetStatistics(
+        dataset=group.name,
+        frames=tuple(records),
+    )
+
 def _validate_loaded_image(
     group: DatasetGroup,
     frame: FrameRecord,
@@ -356,7 +474,7 @@ def _validate_loaded_image(
 
     expected_dtype = np.dtype(group.pixel_dtype)
     actual_dtype = image.dtype
-    if actual_dtype != expected_dtype:
+    if not _dtype_equivalent(actual_dtype, expected_dtype):
         raise Step02Error(
             "Loaded image dtype does not match dataset metadata: "
             f"dataset={group.name!r}, "
@@ -365,6 +483,25 @@ def _validate_loaded_image(
             f"expected={expected_dtype}, "
             f"actual={actual_dtype}."
         )
+
+
+def _dtype_equivalent(
+    actual: np.dtype,
+    expected: np.dtype,
+) -> bool:
+    """Return True when dtype kind and item size match.
+
+    FITS commonly stores multi-byte numeric values in big-endian order, so
+    Astropy may return ``>f4`` or ``>i2`` even when the canonical manifest uses
+    ``float32`` or ``int16``. Byte order alone does not change the numeric dtype
+    expected by later pipeline stages.
+    """
+    actual = np.dtype(actual)
+    expected = np.dtype(expected)
+    return (
+        actual.kind == expected.kind
+        and actual.itemsize == expected.itemsize
+    )
 
 def build_argument_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
