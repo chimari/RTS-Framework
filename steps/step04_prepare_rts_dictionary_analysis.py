@@ -1,18 +1,19 @@
 """Step 04: prepare an RTS dictionary analysis plan.
 
-Version 4.17.0 adds a deterministic interval progress callback wrapper
-without changing the existing per-pixel progress notification contract.
+Version 4.18.0 adds immutable timed progress state and a callback adapter
+without changing the existing integer progress notification contract.
 """
 
 from __future__ import annotations
 
 from pathlib import Path
+from time import monotonic
 
 import csv
 import os
 import tempfile
 
-__version__ = "4.17.0"
+__version__ = "4.18.0"
 
 from dataclasses import dataclass
 
@@ -30,6 +31,7 @@ __all__ = [
     "PixelTimeSeriesStatistics",
     "RTSCandidateResult",
     "RTSDictionaryBuildResult",
+    "RTSProgressState",
     "RTSDictionaryPlan",
     "RTSPixelAnalysisResult",
     "Step04Error",
@@ -46,6 +48,7 @@ __all__ = [
     "iter_image_rts_analyses",
     "iter_rts_candidates",
     "make_interval_progress_callback",
+    "make_timed_progress_callback",
     "iter_rts_pixel_analyses",
     "load_pixel_timeseries",
     "prepare_rts_dictionary_analysis",
@@ -321,6 +324,48 @@ class PixelTimeSeries:
 
 
 
+
+@dataclass(slots=True, frozen=True)
+class RTSProgressState:
+    """Immutable timing information for one progress event."""
+
+    completed: int
+    total: int
+    elapsed_seconds: float
+    pixels_per_second: float | None
+    remaining_seconds: float | None
+
+    @property
+    def fraction_complete(self) -> float:
+        """Return completion as a deterministic fraction in ``[0, 1]``."""
+        if self.total == 0:
+            return 1.0
+        return self.completed / self.total
+
+    @property
+    def percent_complete(self) -> float:
+        """Return completion percentage."""
+        return 100.0 * self.fraction_complete
+
+    @property
+    def is_complete(self) -> bool:
+        """Return whether this event represents completion."""
+        return self.completed == self.total
+
+    def summary(self) -> dict[str, object]:
+        """Return a deterministic JSON-serializable timing summary."""
+        return {
+            "completed": self.completed,
+            "total": self.total,
+            "fraction_complete": self.fraction_complete,
+            "percent_complete": self.percent_complete,
+            "elapsed_seconds": self.elapsed_seconds,
+            "pixels_per_second": self.pixels_per_second,
+            "remaining_seconds": self.remaining_seconds,
+            "is_complete": self.is_complete,
+        }
+
+
 @dataclass(slots=True, frozen=True)
 class RTSDictionaryBuildResult:
     """Immutable summary of one completed RTS dictionary CSV build."""
@@ -540,6 +585,71 @@ def make_interval_progress_callback(callback, *, every: int):
             last_forwarded = event
 
     return interval_callback
+
+
+
+
+def make_timed_progress_callback(callback, *, clock=None):
+    """Adapt integer progress events into immutable :class:`RTSProgressState`.
+
+    ``clock`` must be a zero-argument callable returning monotonic seconds.
+    The first received event defines the start time. Speed and remaining time
+    are ``None`` until at least one pixel has completed.
+    """
+    if not callable(callback):
+        raise Step04Error("callback must be callable.")
+    if clock is None:
+        clock = monotonic
+    elif not callable(clock):
+        raise Step04Error("clock must be callable or None.")
+
+    start_time: float | None = None
+    previous_completed: int | None = None
+    previous_total: int | None = None
+
+    def timed_callback(completed: int, total: int) -> None:
+        nonlocal start_time, previous_completed, previous_total
+
+        if isinstance(completed, bool) or not isinstance(completed, int):
+            raise Step04Error("completed must be an integer.")
+        if isinstance(total, bool) or not isinstance(total, int):
+            raise Step04Error("total must be an integer.")
+        if completed < 0:
+            raise Step04Error("completed must be non-negative.")
+        if total < 0:
+            raise Step04Error("total must be non-negative.")
+        if completed > total:
+            raise Step04Error("completed must not exceed total.")
+        if previous_total is not None and total != previous_total:
+            raise Step04Error("total must remain unchanged.")
+        if previous_completed is not None and completed < previous_completed:
+            raise Step04Error("completed must not decrease.")
+
+        now = float(clock())
+        if start_time is None:
+            start_time = now
+        elapsed = max(0.0, now - start_time)
+
+        if completed > 0 and elapsed > 0.0:
+            rate = completed / elapsed
+            remaining = (total - completed) / rate
+        else:
+            rate = None
+            remaining = None
+
+        state = RTSProgressState(
+            completed=completed,
+            total=total,
+            elapsed_seconds=elapsed,
+            pixels_per_second=rate,
+            remaining_seconds=remaining,
+        )
+        callback(state)
+
+        previous_completed = completed
+        previous_total = total
+
+    return timed_callback
 
 
 
