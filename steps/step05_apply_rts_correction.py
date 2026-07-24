@@ -1,7 +1,7 @@
 """Step 05: prepare deterministic RTS correction plans.
 
-Version 5.1.0 adds deterministic classification of current candidate-pixel
-values without modifying the input image.
+Version 5.2.0 adds deterministic correction decisions derived from
+candidate classifications without modifying the input image.
 """
 
 from __future__ import annotations
@@ -20,15 +20,19 @@ from steps.step04_prepare_rts_dictionary_analysis import (
     validate_rts_dictionary_artifacts,
 )
 
-__version__ = "5.1.0"
+__version__ = "5.2.0"
 
 __all__ = [
     "RTSCandidateClassification",
     "RTSCandidateState",
     "RTSCorrectionCandidate",
     "RTSCorrectionClassificationResult",
+    "RTSCorrectionDecision",
+    "RTSCorrectionDecisionReason",
+    "RTSCorrectionDecisionResult",
     "RTSCorrectionPlan",
     "Step05Error",
+    "build_rts_correction_decisions",
     "classify_rts_correction_candidates",
     "prepare_rts_correction",
 ]
@@ -46,6 +50,16 @@ class RTSCandidateState(str, Enum):
     UPPER = "UPPER"
     MIDPOINT = "MIDPOINT"
     OUTSIDE = "OUTSIDE"
+
+
+
+class RTSCorrectionDecisionReason(str, Enum):
+    """Reason associated with one deterministic correction decision."""
+
+    LOWER_STATE = "LOWER_STATE"
+    UPPER_STATE = "UPPER_STATE"
+    MIDPOINT_UNCERTAIN = "MIDPOINT_UNCERTAIN"
+    OUTSIDE_DICTIONARY = "OUTSIDE_DICTIONARY"
 
 
 @dataclass(slots=True, frozen=True)
@@ -216,6 +230,113 @@ class RTSCorrectionClassificationResult:
             "outside_count": self.outside_count,
             "classifications": tuple(
                 item.summary() for item in self.classifications
+            ),
+        }
+
+
+
+@dataclass(slots=True, frozen=True)
+class RTSCorrectionDecision:
+    """Immutable correction decision for one classified RTS candidate."""
+
+    classification: RTSCandidateClassification
+    target_value: float | None
+    correction_value: float | None
+    is_correctable: bool
+    reason: RTSCorrectionDecisionReason
+
+    @property
+    def candidate(self) -> RTSCorrectionCandidate:
+        """Return the candidate associated with this decision."""
+        return self.classification.candidate
+
+    @property
+    def coordinate(self) -> tuple[int, int]:
+        """Return the candidate coordinate."""
+        return self.classification.coordinate
+
+    @property
+    def current_value(self) -> float:
+        """Return the currently observed pixel value."""
+        return self.classification.pixel_value
+
+    @property
+    def current_state(self) -> RTSCandidateState:
+        """Return the classified current state."""
+        return self.classification.state
+
+    def summary(self) -> dict[str, object]:
+        """Return one deterministic JSON-serializable decision summary."""
+        return {
+            "row": self.candidate.row,
+            "column": self.candidate.column,
+            "coordinate": self.coordinate,
+            "current_value": self.current_value,
+            "current_state": self.current_state.value,
+            "target_value": self.target_value,
+            "correction_value": self.correction_value,
+            "is_correctable": self.is_correctable,
+            "reason": self.reason.value,
+        }
+
+
+@dataclass(slots=True, frozen=True)
+class RTSCorrectionDecisionResult:
+    """Immutable correction decisions derived from one classification result."""
+
+    classification_result: RTSCorrectionClassificationResult
+    decisions: tuple[RTSCorrectionDecision, ...]
+
+    @property
+    def plan(self) -> RTSCorrectionPlan:
+        """Return the correction plan associated with these decisions."""
+        return self.classification_result.plan
+
+    @property
+    def decision_count(self) -> int:
+        """Return the number of correction decisions."""
+        return len(self.decisions)
+
+    @property
+    def correctable_count(self) -> int:
+        """Return the number of decisions that may be applied."""
+        return sum(decision.is_correctable for decision in self.decisions)
+
+    @property
+    def rejected_count(self) -> int:
+        """Return the number of decisions that must not be applied."""
+        return self.decision_count - self.correctable_count
+
+    def count_reason(self, reason: RTSCorrectionDecisionReason) -> int:
+        """Count decisions with one reason."""
+        if not isinstance(reason, RTSCorrectionDecisionReason):
+            raise Step05Error(
+                "reason must be an RTSCorrectionDecisionReason."
+            )
+        return sum(decision.reason is reason for decision in self.decisions)
+
+    def summary(self) -> dict[str, object]:
+        """Return one deterministic JSON-serializable decision summary."""
+        return {
+            "step05_version": __version__,
+            "input_path": str(self.plan.input_path),
+            "decision_count": self.decision_count,
+            "correctable_count": self.correctable_count,
+            "rejected_count": self.rejected_count,
+            "lower_state_count": self.count_reason(
+                RTSCorrectionDecisionReason.LOWER_STATE
+            ),
+            "upper_state_count": self.count_reason(
+                RTSCorrectionDecisionReason.UPPER_STATE
+            ),
+            "midpoint_uncertain_count": self.count_reason(
+                RTSCorrectionDecisionReason.MIDPOINT_UNCERTAIN
+            ),
+            "outside_dictionary_count": self.count_reason(
+                RTSCorrectionDecisionReason.OUTSIDE_DICTIONARY
+            ),
+            "decisions": tuple(
+                decision.summary() for decision in self.decisions
             ),
         }
 
@@ -504,4 +625,77 @@ def classify_rts_correction_candidates(
         plan=plan,
         state_tolerance_fraction=fraction,
         classifications=classifications,
+    )
+
+
+def _build_rts_correction_decision(
+    classification: RTSCandidateClassification,
+) -> RTSCorrectionDecision:
+    """Build one deterministic correction decision."""
+    state = classification.state
+
+    if state is RTSCandidateState.LOWER:
+        target_value = classification.candidate.lower_state_center
+        reason = RTSCorrectionDecisionReason.LOWER_STATE
+        is_correctable = True
+    elif state is RTSCandidateState.UPPER:
+        target_value = classification.candidate.upper_state_center
+        reason = RTSCorrectionDecisionReason.UPPER_STATE
+        is_correctable = True
+    elif state is RTSCandidateState.MIDPOINT:
+        target_value = None
+        reason = RTSCorrectionDecisionReason.MIDPOINT_UNCERTAIN
+        is_correctable = False
+    elif state is RTSCandidateState.OUTSIDE:
+        target_value = None
+        reason = RTSCorrectionDecisionReason.OUTSIDE_DICTIONARY
+        is_correctable = False
+    else:
+        raise Step05Error(
+            f"unsupported RTS candidate state: {state!r}."
+        )
+
+    correction_value = (
+        float(target_value - classification.pixel_value)
+        if target_value is not None
+        else None
+    )
+
+    return RTSCorrectionDecision(
+        classification=classification,
+        target_value=(
+            float(target_value) if target_value is not None else None
+        ),
+        correction_value=correction_value,
+        is_correctable=is_correctable,
+        reason=reason,
+    )
+
+
+def build_rts_correction_decisions(
+    classification_result: RTSCorrectionClassificationResult,
+) -> RTSCorrectionDecisionResult:
+    """Build deterministic correction decisions without modifying the image."""
+    if not isinstance(
+        classification_result,
+        RTSCorrectionClassificationResult,
+    ):
+        raise Step05Error(
+            "classification_result must be an "
+            "RTSCorrectionClassificationResult."
+        )
+
+    decisions = tuple(
+        _build_rts_correction_decision(classification)
+        for classification in classification_result.classifications
+    )
+
+    if len(decisions) != classification_result.candidate_count:
+        raise Step05Error(
+            "correction decision count does not match candidate count."
+        )
+
+    return RTSCorrectionDecisionResult(
+        classification_result=classification_result,
+        decisions=decisions,
     )
