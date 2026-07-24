@@ -1,6 +1,6 @@
 """Step 04: prepare an RTS dictionary analysis plan.
 
-Version 4.34.0 adds deterministic JSON summaries and CLI output
+Version 4.35.0 adds deterministic audit JSON report export
 while preserving all existing public APIs.
 """
 
@@ -17,7 +17,7 @@ import os
 import sys
 import tempfile
 
-__version__ = "4.34.0"
+__version__ = "4.35.0"
 
 from dataclasses import dataclass
 from enum import Enum
@@ -88,6 +88,7 @@ __all__ = [
     "RTSAuditStatusName",
     "RTSAuditStatus",
     "evaluate_rts_input_audit",
+    "write_rts_input_audit_json",
     "run_rts_input_audit_cli",
     "main",
     "build_rts_dictionary_artifacts",
@@ -4321,6 +4322,36 @@ def _validate_min_frames(value: int) -> int:
     return value
 
 
+
+def write_rts_input_audit_json(
+    audit: RTSInputAuditResult,
+    output_path,
+    *,
+    status=None,
+) -> Path:
+    """Write one deterministic external audit JSON report."""
+    if not isinstance(audit, RTSInputAuditResult):
+        raise Step04Error("audit must be an RTSInputAuditResult.")
+    if status is None:
+        status = evaluate_rts_input_audit(audit)
+    if not isinstance(status, RTSAuditStatus):
+        raise Step04Error("status must be an RTSAuditStatus.")
+
+    destination = _normalized_artifact_path(output_path)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+
+    with destination.open("w", encoding="utf-8", newline="\n") as stream:
+        json.dump(
+            audit.to_json_summary(status),
+            stream,
+            ensure_ascii=False,
+            indent=2,
+        )
+        stream.write("\n")
+
+    return destination
+
+
 def _build_rts_input_audit_argument_parser():
     """Return the stable Step 04 input-audit CLI parser."""
     parser = argparse.ArgumentParser(
@@ -4362,6 +4393,13 @@ def _build_rts_input_audit_argument_parser():
         "--json",
         action="store_true",
         help="Write one deterministic JSON object to standard output.",
+    )
+    parser.add_argument(
+        "--json-output",
+        dest="json_output_path",
+        type=Path,
+        default=None,
+        help="Write the deterministic JSON report to this file.",
     )
     parser.add_argument(
         "--version",
@@ -4441,6 +4479,13 @@ def run_rts_input_audit_cli(
         if not namespace.quiet:
             print(f"RTS input audit error: {exc}", file=error_stream)
         return 64
+
+    if namespace.json_output_path is not None:
+        write_rts_input_audit_json(
+            audit,
+            namespace.json_output_path,
+            status=status,
+        )
 
     if namespace.json:
         _write_rts_input_audit_cli_json(
