@@ -1,7 +1,7 @@
 """Step 04: prepare an RTS dictionary analysis plan.
 
-Version 4.14.0 adds a high-level image-to-CSV pipeline by composing the
-existing image analysis, candidate filtering, and atomic CSV writer APIs.
+Version 4.15.0 adds an immutable build result for reporting the output
+path, analyzed region, analyzed pixel count, and final candidate count.
 """
 
 from __future__ import annotations
@@ -12,7 +12,7 @@ import csv
 import os
 import tempfile
 
-__version__ = "4.14.0"
+__version__ = "4.15.0"
 
 from dataclasses import dataclass
 
@@ -29,6 +29,7 @@ __all__ = [
     "PixelTimeSeries",
     "PixelTimeSeriesStatistics",
     "RTSCandidateResult",
+    "RTSDictionaryBuildResult",
     "RTSDictionaryPlan",
     "RTSPixelAnalysisResult",
     "Step04Error",
@@ -50,6 +51,7 @@ __all__ = [
     "rts_candidate_to_row",
     "write_rts_dictionary_csv",
     "build_rts_dictionary_csv",
+    "build_rts_dictionary_csv_result",
 ]
 
 
@@ -316,6 +318,44 @@ class PixelTimeSeries:
         }
 
 
+
+
+@dataclass(slots=True, frozen=True)
+class RTSDictionaryBuildResult:
+    """Immutable summary of one completed RTS dictionary CSV build."""
+
+    output_path: Path
+    dataset: str
+    row_start: int
+    row_stop: int
+    column_start: int
+    column_stop: int
+    analyzed_pixel_count: int
+    candidate_count: int
+
+    @property
+    def region_shape(self) -> tuple[int, int]:
+        """Return the analyzed region shape as ``(height, width)``."""
+        return (
+            self.row_stop - self.row_start,
+            self.column_stop - self.column_start,
+        )
+
+    def summary(self) -> dict[str, object]:
+        """Return a deterministic JSON-serializable build summary."""
+        return {
+            "output_path": str(self.output_path),
+            "dataset": self.dataset,
+            "row_start": self.row_start,
+            "row_stop": self.row_stop,
+            "column_start": self.column_start,
+            "column_stop": self.column_stop,
+            "region_shape": self.region_shape,
+            "analyzed_pixel_count": self.analyzed_pixel_count,
+            "candidate_count": self.candidate_count,
+        }
+
+
 @dataclass(slots=True, frozen=True)
 class RTSDictionaryPlan:
     """Immutable metadata plan for later RTS dictionary generation."""
@@ -467,6 +507,7 @@ RTS_DICTIONARY_COLUMNS = (
 
 
 
+
 def build_rts_dictionary_csv(
     plan: RTSDictionaryPlan,
     output_path,
@@ -484,42 +525,16 @@ def build_rts_dictionary_csv(
 ) -> Path:
     """Analyze an image region and atomically write its final RTS candidates.
 
-    This function introduces no new analysis logic. It composes
-    :func:`iter_image_rts_analyses`, :func:`iter_rts_candidates`, and
-    :func:`write_rts_dictionary_csv`.
-
-    Parameters
-    ----------
-    plan
-        Prepared RTS dictionary analysis plan.
-    output_path
-        Destination CSV path.
-    row_start, row_stop, column_start, column_stop
-        Optional half-open image region. ``None`` uses the corresponding image
-        edge.
-    minimum_score, minimum_state_count, minimum_separation
-        Two-state candidate thresholds.
-    minimum_transition_count, minimum_lower_run, minimum_upper_run
-        Temporal candidate thresholds.
-
-    Returns
-    -------
-    pathlib.Path
-        The destination path returned by :func:`write_rts_dictionary_csv`.
-
-    Raises
-    ------
-    Step04Error
-        Propagated from the composed Step 04 APIs.
+    This compatibility API preserves the v4.14.0 return type. Use
+    :func:`build_rts_dictionary_csv_result` when build counts and resolved ROI
+    metadata are needed.
     """
-    normalized_row_start = 0 if row_start is None else row_start
-    normalized_column_start = 0 if column_start is None else column_start
-
-    analyses = iter_image_rts_analyses(
+    result = build_rts_dictionary_csv_result(
         plan,
-        row_start=normalized_row_start,
+        output_path,
+        row_start=row_start,
         row_stop=row_stop,
-        column_start=normalized_column_start,
+        column_start=column_start,
         column_stop=column_stop,
         minimum_score=minimum_score,
         minimum_state_count=minimum_state_count,
@@ -528,8 +543,95 @@ def build_rts_dictionary_csv(
         minimum_lower_run=minimum_lower_run,
         minimum_upper_run=minimum_upper_run,
     )
-    candidates = iter_rts_candidates(analyses)
-    return write_rts_dictionary_csv(output_path, candidates)
+    return result.output_path
+
+
+def build_rts_dictionary_csv_result(
+    plan: RTSDictionaryPlan,
+    output_path,
+    *,
+    row_start: int | None = None,
+    row_stop: int | None = None,
+    column_start: int | None = None,
+    column_stop: int | None = None,
+    minimum_score: float = 0.0,
+    minimum_state_count: int = 1,
+    minimum_separation: float = 0.0,
+    minimum_transition_count: int = 0,
+    minimum_lower_run: int = 1,
+    minimum_upper_run: int = 1,
+) -> RTSDictionaryBuildResult:
+    """Build an RTS dictionary CSV and return immutable execution metadata.
+
+    No new RTS analysis or candidate logic is introduced. Counts are collected
+    while the existing lazy analysis and filtering pipeline is consumed by the
+    atomic CSV writer.
+    """
+    if not isinstance(plan, RTSDictionaryPlan):
+        raise Step04Error(
+            "plan must be an RTSDictionaryPlan returned by "
+            "prepare_rts_dictionary_analysis()."
+        )
+
+    height, width = plan.image_shape
+    resolved_row_start = 0 if row_start is None else row_start
+    resolved_row_stop = height if row_stop is None else row_stop
+    resolved_column_start = 0 if column_start is None else column_start
+    resolved_column_stop = width if column_stop is None else column_stop
+
+    # Trigger the existing canonical ROI validation before output creation.
+    validation_iterator = iter_image_coordinates(
+        plan,
+        row_start=resolved_row_start,
+        row_stop=resolved_row_stop,
+        column_start=resolved_column_start,
+        column_stop=resolved_column_stop,
+    )
+    next(validation_iterator, None)
+
+    analyzed_pixel_count = 0
+    candidate_count = 0
+
+    analyses = iter_image_rts_analyses(
+        plan,
+        row_start=resolved_row_start,
+        row_stop=resolved_row_stop,
+        column_start=resolved_column_start,
+        column_stop=resolved_column_stop,
+        minimum_score=minimum_score,
+        minimum_state_count=minimum_state_count,
+        minimum_separation=minimum_separation,
+        minimum_transition_count=minimum_transition_count,
+        minimum_lower_run=minimum_lower_run,
+        minimum_upper_run=minimum_upper_run,
+    )
+
+    def counted_analyses():
+        nonlocal analyzed_pixel_count
+        for analysis in analyses:
+            analyzed_pixel_count += 1
+            yield analysis
+
+    candidates = iter_rts_candidates(counted_analyses())
+
+    def counted_candidates():
+        nonlocal candidate_count
+        for candidate in candidates:
+            candidate_count += 1
+            yield candidate
+
+    written_path = write_rts_dictionary_csv(output_path, counted_candidates())
+
+    return RTSDictionaryBuildResult(
+        output_path=written_path,
+        dataset=plan.dataset,
+        row_start=int(resolved_row_start),
+        row_stop=int(resolved_row_stop),
+        column_start=int(resolved_column_start),
+        column_stop=int(resolved_column_stop),
+        analyzed_pixel_count=analyzed_pixel_count,
+        candidate_count=candidate_count,
+    )
 
 def write_rts_dictionary_csv(path, candidates) -> Path:
     """Atomically write final RTS candidates to a deterministic UTF-8 CSV.
