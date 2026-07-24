@@ -1,7 +1,7 @@
 """Step 04: prepare an RTS dictionary analysis plan.
 
-Version 4.25.0 adds joint loading and cross-validation of RTS dictionary
-CSV/metadata artifact pairs while preserving all existing public APIs.
+Version 4.26.0 adds validated input-file inventory checks for RTS
+dictionary metadata while preserving all existing public APIs.
 """
 
 from __future__ import annotations
@@ -14,7 +14,7 @@ import json
 import os
 import tempfile
 
-__version__ = "4.25.0"
+__version__ = "4.26.0"
 
 from dataclasses import dataclass
 
@@ -37,6 +37,7 @@ __all__ = [
     "RTSDictionaryRow",
     "RTSDictionaryCSV",
     "RTSDictionaryArtifacts",
+    "RTSInputFileValidation",
     "RTSProgressState",
     "RTSCancellationInfo",
     "RTSDictionaryBuildParameters",
@@ -67,6 +68,7 @@ __all__ = [
     "load_rts_dictionary_metadata_json",
     "load_rts_dictionary_csv",
     "load_rts_dictionary_artifacts",
+    "validate_rts_dictionary_input_files",
     "build_rts_dictionary_artifacts",
     "build_rts_dictionary_csv",
     "build_rts_dictionary_csv_result",
@@ -636,6 +638,32 @@ class RTSDictionaryArtifacts:
             "candidate_count": self.candidate_count,
             "dictionary": self.dictionary.summary(),
             "metadata": self.metadata.summary(),
+        }
+
+
+
+@dataclass(slots=True, frozen=True)
+class RTSInputFileValidation:
+    """Immutable result of validating metadata-recorded input files."""
+
+    metadata_path: Path
+    expected_file_count: int
+    validated_filepaths: tuple[Path, ...]
+
+    @property
+    def validated_file_count(self) -> int:
+        """Return the number of successfully validated input files."""
+        return len(self.validated_filepaths)
+
+    def summary(self) -> dict[str, object]:
+        """Return a deterministic JSON-serializable validation summary."""
+        return {
+            "metadata_path": str(self.metadata_path),
+            "expected_file_count": self.expected_file_count,
+            "validated_file_count": self.validated_file_count,
+            "validated_filepaths": tuple(
+                str(path) for path in self.validated_filepaths
+            ),
         }
 
 
@@ -1553,6 +1581,57 @@ def load_rts_dictionary_artifacts(
     return RTSDictionaryArtifacts(
         dictionary=dictionary,
         metadata=metadata,
+    )
+
+
+
+
+def validate_rts_dictionary_input_files(
+    metadata,
+) -> RTSInputFileValidation:
+    """Validate the input-file inventory recorded in dictionary metadata.
+
+    ``metadata`` may be an already loaded :class:`RTSDictionaryMetadata`
+    instance or a metadata JSON path. Validation checks that the recorded
+    file count matches ``n_frames``, paths are unique after normalization,
+    and every path exists as a regular file.
+    """
+    if isinstance(metadata, RTSDictionaryMetadata):
+        loaded = metadata
+    else:
+        loaded = load_rts_dictionary_metadata_json(metadata)
+
+    if len(loaded.filepaths) != loaded.n_frames:
+        raise Step04Error(
+            "metadata input file count does not match n_frames."
+        )
+
+    normalized_paths: list[Path] = []
+    seen: set[Path] = set()
+    for file_index, filepath in enumerate(loaded.filepaths):
+        normalized = _normalized_artifact_path(filepath)
+        if normalized in seen:
+            raise Step04Error(
+                f"metadata input file {file_index} duplicates another path."
+            )
+        seen.add(normalized)
+
+        if not normalized.exists():
+            raise Step04Error(
+                f"metadata input file {file_index} does not exist: "
+                f"{normalized}"
+            )
+        if not normalized.is_file():
+            raise Step04Error(
+                f"metadata input file {file_index} is not a regular file: "
+                f"{normalized}"
+            )
+        normalized_paths.append(normalized)
+
+    return RTSInputFileValidation(
+        metadata_path=loaded.metadata_path,
+        expected_file_count=loaded.n_frames,
+        validated_filepaths=tuple(normalized_paths),
     )
 
 
