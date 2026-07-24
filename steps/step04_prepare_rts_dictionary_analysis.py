@@ -1,12 +1,12 @@
 """Step 04: prepare an RTS dictionary analysis plan.
 
-Version 4.8.0 adds deterministic lazy iteration over explicitly supplied
-pixel coordinates while reusing the existing one-pixel orchestration API.
+Version 4.9.0 adds deterministic lazy row-major coordinate generation for
+a validated full image or rectangular region of interest.
 """
 
 from __future__ import annotations
 
-__version__ = "4.8.0"
+__version__ = "4.9.0"
 
 from dataclasses import dataclass
 
@@ -35,6 +35,7 @@ __all__ = [
     "classify_temporal_rts_candidate",
     "compute_pixel_timeseries_statistics",
     "compute_two_state_score",
+    "iter_image_coordinates",
     "iter_rts_pixel_analyses",
     "load_pixel_timeseries",
     "prepare_rts_dictionary_analysis",
@@ -337,6 +338,83 @@ class RTSDictionaryPlan:
 
 
 
+
+
+def iter_image_coordinates(
+    plan: RTSDictionaryPlan,
+    *,
+    row_start: int = 0,
+    row_stop: int | None = None,
+    column_start: int = 0,
+    column_stop: int | None = None,
+):
+    """Yield validated image coordinates in deterministic row-major order.
+
+    The stop bounds are exclusive, matching Python ``range`` semantics. ``None``
+    means the full image height or width. Empty regions are valid when a start
+    equals its corresponding stop.
+
+    Parameters
+    ----------
+    plan
+        Plan returned by :func:`prepare_rts_dictionary_analysis`.
+    row_start, row_stop
+        Inclusive row start and exclusive row stop.
+    column_start, column_stop
+        Inclusive column start and exclusive column stop.
+
+    Yields
+    ------
+    tuple[int, int]
+        ``(row, column)`` pairs in row-major order.
+
+    Raises
+    ------
+    Step04Error
+        If the plan is invalid, a bound is not an integer, a bound lies outside
+        the image, or a start is greater than its corresponding stop.
+    """
+    if not isinstance(plan, RTSDictionaryPlan):
+        raise Step04Error(
+            "plan must be an RTSDictionaryPlan returned by "
+            "prepare_rts_dictionary_analysis()."
+        )
+
+    height, width = plan.image_shape
+
+    def require_bound(name: str, value: object, maximum: int) -> int:
+        if isinstance(value, bool) or not isinstance(value, (int, np.integer)):
+            raise Step04Error(f"{name} must be an integer.")
+        converted = int(value)
+        if converted < 0 or converted > maximum:
+            raise Step04Error(
+                f"{name} must satisfy 0 <= {name} <= {maximum}."
+            )
+        return converted
+
+    row_start = require_bound("row_start", row_start, height)
+    column_start = require_bound("column_start", column_start, width)
+
+    if row_stop is None:
+        row_stop = height
+    else:
+        row_stop = require_bound("row_stop", row_stop, height)
+
+    if column_stop is None:
+        column_stop = width
+    else:
+        column_stop = require_bound("column_stop", column_stop, width)
+
+    if row_start > row_stop:
+        raise Step04Error("row_start must be less than or equal to row_stop.")
+    if column_start > column_stop:
+        raise Step04Error(
+            "column_start must be less than or equal to column_stop."
+        )
+
+    for row in range(row_start, row_stop):
+        for column in range(column_start, column_stop):
+            yield (row, column)
 
 def iter_rts_pixel_analyses(
     plan: RTSDictionaryPlan,
