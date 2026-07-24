@@ -1,7 +1,7 @@
 """Step 05: prepare deterministic RTS correction plans.
 
-Version 5.8.0 adds deterministic persistent batch manifests in JSON and
-CSV formats for audit, provenance, and downstream automation.
+Version 5.9.0 adds deterministic correction provenance with environment,
+configuration, and complete input/output artifact hashes.
 """
 
 from __future__ import annotations
@@ -11,9 +11,11 @@ from enum import Enum
 from pathlib import Path
 import argparse
 import csv
+import datetime
 import hashlib
 import io
 import json
+import platform
 import sys
 
 import numpy as np
@@ -34,7 +36,7 @@ from steps.step04_prepare_rts_dictionary_analysis import (
     validate_rts_dictionary_artifacts,
 )
 
-__version__ = "5.8.0"
+__version__ = "5.9.0"
 
 __all__ = [
     "RTSCandidateClassification",
@@ -58,6 +60,7 @@ __all__ = [
     "run_rts_correction_batch_cli",
     "write_rts_batch_manifest_csv",
     "write_rts_batch_manifest_json",
+    "write_rts_batch_provenance_json",
     "run_rts_correction_cli",
     "write_rts_corrected_fits",
 ]
@@ -1670,6 +1673,185 @@ def write_rts_batch_manifest_csv(
     return path
 
 
+
+def _sha256_file(path: str | Path) -> str:
+    """Return the SHA256 digest for one existing regular file."""
+    resolved = Path(path).expanduser().resolve()
+    if not resolved.exists():
+        raise Step05Error(f"file does not exist: '{resolved}'.")
+    if not resolved.is_file():
+        raise Step05Error(f"path is not a regular file: '{resolved}'.")
+    digest = hashlib.sha256()
+    try:
+        with resolved.open("rb") as stream:
+            for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+                digest.update(chunk)
+    except OSError as exc:
+        raise Step05Error(
+            f"Could not hash file '{resolved}': {exc}"
+        ) from exc
+    return digest.hexdigest()
+
+
+
+def _read_dictionary_path_from_metadata(
+    metadata_path: str | Path,
+) -> Path:
+    """Return the validated dictionary CSV path for Step 04 metadata."""
+    resolved = Path(metadata_path).expanduser().resolve()
+    try:
+        validation = validate_rts_dictionary_artifacts(resolved)
+    except Step04Error as exc:
+        raise Step05Error(
+            f"Could not validate Step 04 dictionary artifacts: {exc}"
+        ) from exc
+    return validation.dictionary_csv_path.resolve()
+
+def _utc_timestamp() -> str:
+    """Return one explicit UTC timestamp for provenance."""
+    return (
+        datetime.datetime.now(datetime.timezone.utc)
+        .replace(microsecond=0)
+        .isoformat()
+        .replace("+00:00", "Z")
+    )
+
+
+def write_rts_batch_provenance_json(
+    batch_result: RTSCorrectionBatchResult,
+    provenance_path: str | Path,
+    *,
+    state_tolerance_fraction: float = 0.25,
+    overwrite: bool = False,
+    execution_time_utc: str | None = None,
+    cli_arguments: tuple[str, ...] | list[str] | None = None,
+) -> Path:
+    """Persist and verify deterministic Step 05 correction provenance."""
+    if not isinstance(batch_result, RTSCorrectionBatchResult):
+        raise Step05Error(
+            "batch_result must be an RTSCorrectionBatchResult."
+        )
+    if not isinstance(state_tolerance_fraction, (int, float)):
+        raise Step05Error(
+            "state_tolerance_fraction must be a real number."
+        )
+    tolerance = float(state_tolerance_fraction)
+    if not np.isfinite(tolerance) or tolerance <= 0.0:
+        raise Step05Error(
+            "state_tolerance_fraction must be finite and greater than zero."
+        )
+
+    if execution_time_utc is None:
+        timestamp = _utc_timestamp()
+    elif isinstance(execution_time_utc, str) and execution_time_utc:
+        timestamp = execution_time_utc
+    else:
+        raise Step05Error(
+            "execution_time_utc must be a non-empty string or None."
+        )
+
+    if cli_arguments is None:
+        normalized_arguments: tuple[str, ...] = ()
+    else:
+        normalized_arguments = tuple(str(value) for value in cli_arguments)
+
+    path = _validate_batch_manifest_destination(
+        batch_result,
+        provenance_path,
+        overwrite=overwrite,
+    )
+    metadata_path = batch_result.metadata_path.resolve()
+    dictionary_path = _read_dictionary_path_from_metadata(metadata_path)
+
+    items = []
+    for index, item in enumerate(batch_result.items):
+        record: dict[str, object] = {
+            "item_index": index,
+            "input_path": str(item.input_path),
+            "input_sha256": _sha256_file(item.input_path),
+            "output_path": str(item.output_path),
+            "succeeded": item.succeeded,
+            "error": item.error,
+        }
+        if item.output is not None:
+            output_summary = item.output.summary()
+            record.update({
+                "output_sha256": output_summary["sha256"],
+                "output_verified": output_summary["verified"],
+                "applied_count": output_summary["applied_count"],
+                "preserved_count": output_summary["preserved_count"],
+            })
+        else:
+            record.update({
+                "output_sha256": None,
+                "output_verified": False,
+                "applied_count": None,
+                "preserved_count": None,
+            })
+        items.append(record)
+
+    payload = {
+        "provenance_format": "rts-step05-correction-provenance",
+        "provenance_version": 1,
+        "execution_time_utc": timestamp,
+        "software": {
+            "step05_version": __version__,
+            "python_version": platform.python_version(),
+            "python_implementation": platform.python_implementation(),
+            "numpy_version": np.__version__,
+            "astropy_version": fits.__version__
+            if hasattr(fits, "__version__")
+            else __import__("astropy").__version__,
+        },
+        "platform": {
+            "system": platform.system(),
+            "release": platform.release(),
+            "machine": platform.machine(),
+        },
+        "configuration": {
+            "state_tolerance_fraction": tolerance,
+            "overwrite": batch_result.overwrite,
+            "continue_on_error": batch_result.continue_on_error,
+            "cli_arguments": normalized_arguments,
+        },
+        "artifacts": {
+            "metadata_path": str(metadata_path),
+            "metadata_sha256": _sha256_file(metadata_path),
+            "dictionary_path": str(dictionary_path),
+            "dictionary_sha256": _sha256_file(dictionary_path),
+            "output_directory": str(batch_result.output_directory),
+        },
+        "summary": {
+            "total_count": batch_result.total_count,
+            "succeeded_count": batch_result.succeeded_count,
+            "failed_count": batch_result.failed_count,
+            "all_succeeded": batch_result.all_succeeded,
+        },
+        "items": tuple(items),
+    }
+
+    content = json.dumps(payload, sort_keys=True, indent=2) + "\n"
+    _atomic_write_manifest(path, content, overwrite=overwrite)
+
+    try:
+        loaded = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        path.unlink(missing_ok=True)
+        raise Step05Error(
+            f"Could not verify provenance JSON '{path}': {exc}"
+        ) from exc
+
+    canonical_payload = json.loads(
+        json.dumps(payload, sort_keys=True, separators=(",", ":"))
+    )
+    if loaded != canonical_payload:
+        path.unlink(missing_ok=True)
+        raise Step05Error(
+            f"provenance JSON verification failed: '{path}'."
+        )
+    return path
+
+
 def _build_rts_correction_batch_cli_parser() -> argparse.ArgumentParser:
     """Build the Step 05 batch command-line parser."""
     parser = argparse.ArgumentParser(
@@ -1751,6 +1933,11 @@ def _build_rts_correction_batch_cli_parser() -> argparse.ArgumentParser:
         "--manifest-csv",
         dest="manifest_csv",
         help="Write a persistent CSV batch manifest to this path.",
+    )
+    parser.add_argument(
+        "--provenance-json",
+        dest="provenance_json",
+        help="Write deterministic correction provenance JSON.",
     )
     parser.add_argument(
         "--version",
@@ -1842,6 +2029,14 @@ def run_rts_correction_batch_cli(
         if args.manifest_csv is not None:
             write_rts_batch_manifest_csv(
                 result, args.manifest_csv, overwrite=args.overwrite
+            )
+        if args.provenance_json is not None:
+            write_rts_batch_provenance_json(
+                result,
+                args.provenance_json,
+                state_tolerance_fraction=args.state_tolerance_fraction,
+                overwrite=args.overwrite,
+                cli_arguments=tuple(sys.argv[1:] if argv is None else argv),
             )
     except Step05Error as exc:
         if args.json_output:
