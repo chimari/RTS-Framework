@@ -1,12 +1,18 @@
 """Step 04: prepare an RTS dictionary analysis plan.
 
-Version 4.12.0 adds deterministic flat-row serialization for one final
-RTS candidate without performing file I/O.
+Version 4.13.0 adds deterministic atomic CSV writing for final RTS
+candidate rows while preserving input order and duplicates.
 """
 
 from __future__ import annotations
 
-__version__ = "4.12.0"
+from pathlib import Path
+
+import csv
+import os
+import tempfile
+
+__version__ = "4.13.0"
 
 from dataclasses import dataclass
 
@@ -42,6 +48,7 @@ __all__ = [
     "load_pixel_timeseries",
     "prepare_rts_dictionary_analysis",
     "rts_candidate_to_row",
+    "write_rts_dictionary_csv",
 ]
 
 
@@ -421,6 +428,142 @@ def iter_image_coordinates(
 
 
 
+
+
+RTS_DICTIONARY_COLUMNS = (
+    "dataset",
+    "row",
+    "column",
+    "n_frames",
+    "minimum",
+    "maximum",
+    "mean",
+    "median",
+    "standard_deviation",
+    "median_absolute_deviation",
+    "peak_to_peak",
+    "lower_state_count",
+    "upper_state_count",
+    "lower_state_center",
+    "upper_state_center",
+    "state_separation",
+    "single_state_residual",
+    "two_state_residual",
+    "two_state_score",
+    "minimum_score",
+    "minimum_state_count",
+    "minimum_separation",
+    "transition_count",
+    "lower_to_upper_count",
+    "upper_to_lower_count",
+    "longest_lower_run",
+    "longest_upper_run",
+    "minimum_transition_count",
+    "minimum_lower_run",
+    "minimum_upper_run",
+    "is_candidate",
+)
+
+
+def write_rts_dictionary_csv(path, candidates) -> Path:
+    """Atomically write final RTS candidates to a deterministic UTF-8 CSV.
+
+    The input iterable is consumed once and lazily. Input order and duplicate
+    references are preserved. Empty input produces a valid header-only CSV.
+    The destination is replaced only after the entire input has been validated
+    and serialized successfully.
+
+    Parameters
+    ----------
+    path
+        Destination path accepted by :class:`pathlib.Path`.
+    candidates
+        Iterable of final :class:`RTSPixelAnalysisResult` objects.
+
+    Returns
+    -------
+    pathlib.Path
+        The normalized destination path.
+
+    Raises
+    ------
+    Step04Error
+        If the path is invalid, the candidate source is not iterable, an item
+        is invalid or not a final candidate, or writing/replacing fails.
+    """
+    try:
+        destination = Path(path)
+    except TypeError as exc:
+        raise Step04Error("path must be path-like.") from exc
+
+    if destination.exists() and destination.is_dir():
+        raise Step04Error(f"path must not be a directory: {destination}")
+
+    try:
+        iterator = iter(candidates)
+    except TypeError as exc:
+        raise Step04Error(
+            "candidates must be an iterable of final RTS candidates."
+        ) from exc
+
+    parent = destination.parent
+    try:
+        parent.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        raise Step04Error(
+            f"Could not create output directory '{parent}': {exc}"
+        ) from exc
+
+    temporary_path: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            newline="",
+            dir=parent,
+            prefix=f".{destination.name}.",
+            suffix=".tmp",
+            delete=False,
+        ) as stream:
+            temporary_path = Path(stream.name)
+            writer = csv.DictWriter(
+                stream,
+                fieldnames=RTS_DICTIONARY_COLUMNS,
+                lineterminator="\n",
+                extrasaction="raise",
+            )
+            writer.writeheader()
+
+            for index, candidate in enumerate(iterator):
+                try:
+                    row = rts_candidate_to_row(candidate)
+                except Step04Error as exc:
+                    raise Step04Error(
+                        f"Could not serialize candidates item {index}: {exc}"
+                    ) from exc
+                writer.writerow(row)
+
+            stream.flush()
+            os.fsync(stream.fileno())
+
+        os.replace(temporary_path, destination)
+        temporary_path = None
+        return destination
+
+    except Step04Error:
+        raise
+    except (OSError, csv.Error, ValueError) as exc:
+        raise Step04Error(
+            f"Could not write RTS dictionary CSV '{destination}': {exc}"
+        ) from exc
+    finally:
+        if temporary_path is not None:
+            try:
+                temporary_path.unlink()
+            except FileNotFoundError:
+                pass
+            except OSError:
+                pass
 
 def rts_candidate_to_row(result: RTSPixelAnalysisResult) -> dict[str, object]:
     """Return one final RTS candidate as a deterministic flat CSV-ready row.
