@@ -1,7 +1,7 @@
 """Step 05: prepare deterministic RTS correction plans.
 
-Version 5.2.0 adds deterministic correction decisions derived from
-candidate classifications without modifying the input image.
+Version 5.3.0 applies correctable decisions to an independent in-memory
+image copy while preserving the input FITS file.
 """
 
 from __future__ import annotations
@@ -20,11 +20,12 @@ from steps.step04_prepare_rts_dictionary_analysis import (
     validate_rts_dictionary_artifacts,
 )
 
-__version__ = "5.2.0"
+__version__ = "5.3.0"
 
 __all__ = [
     "RTSCandidateClassification",
     "RTSCandidateState",
+    "RTSCorrectionApplicationResult",
     "RTSCorrectionCandidate",
     "RTSCorrectionClassificationResult",
     "RTSCorrectionDecision",
@@ -32,6 +33,7 @@ __all__ = [
     "RTSCorrectionDecisionResult",
     "RTSCorrectionPlan",
     "Step05Error",
+    "apply_rts_correction_in_memory",
     "build_rts_correction_decisions",
     "classify_rts_correction_candidates",
     "prepare_rts_correction",
@@ -338,6 +340,57 @@ class RTSCorrectionDecisionResult:
             "decisions": tuple(
                 decision.summary() for decision in self.decisions
             ),
+        }
+
+
+
+@dataclass(slots=True, frozen=True)
+class RTSCorrectionApplicationResult:
+    """Immutable metadata plus an independent corrected image array."""
+
+    decision_result: RTSCorrectionDecisionResult
+    corrected_image: np.ndarray
+    applied_count: int
+    preserved_count: int
+    output_dtype: str
+
+    def __post_init__(self) -> None:
+        image = np.asarray(self.corrected_image)
+        if image.ndim != 2:
+            raise Step05Error("corrected_image must be two-dimensional.")
+        if tuple(int(value) for value in image.shape) != self.plan.image_shape:
+            raise Step05Error(
+                "corrected_image shape does not match the correction plan."
+            )
+        if self.applied_count < 0 or self.preserved_count < 0:
+            raise Step05Error("application counts must be non-negative.")
+        if (
+            self.applied_count + self.preserved_count
+            != self.decision_result.decision_count
+        ):
+            raise Step05Error(
+                "application counts do not match the decision count."
+            )
+
+        independent = np.array(image, copy=True)
+        independent.setflags(write=False)
+        object.__setattr__(self, "corrected_image", independent)
+
+    @property
+    def plan(self) -> RTSCorrectionPlan:
+        """Return the correction plan associated with the result."""
+        return self.decision_result.plan
+
+    def summary(self) -> dict[str, object]:
+        """Return deterministic metadata without serializing image pixels."""
+        return {
+            "step05_version": __version__,
+            "input_path": str(self.plan.input_path),
+            "image_shape": self.plan.image_shape,
+            "output_dtype": self.output_dtype,
+            "decision_count": self.decision_result.decision_count,
+            "applied_count": self.applied_count,
+            "preserved_count": self.preserved_count,
         }
 
 
@@ -698,4 +751,127 @@ def build_rts_correction_decisions(
     return RTSCorrectionDecisionResult(
         classification_result=classification_result,
         decisions=decisions,
+    )
+
+
+def _coerce_target_value_for_dtype(
+    target_value: float,
+    dtype: np.dtype,
+    coordinate: tuple[int, int],
+):
+    """Convert one target value safely for the output dtype."""
+    if not np.isfinite(target_value):
+        raise Step05Error(
+            f"non-finite correction target at {coordinate}."
+        )
+
+    if np.issubdtype(dtype, np.integer):
+        rounded = float(np.rint(target_value))
+        info = np.iinfo(dtype)
+        if rounded < info.min or rounded > info.max:
+            raise Step05Error(
+                f"correction target {target_value} at {coordinate} "
+                f"is outside dtype range [{info.min}, {info.max}]."
+            )
+        return dtype.type(rounded)
+
+    if np.issubdtype(dtype, np.floating):
+        cast_value = dtype.type(target_value)
+        if not np.isfinite(cast_value):
+            raise Step05Error(
+                f"correction target {target_value} at {coordinate} "
+                f"cannot be represented by dtype {dtype.name}."
+            )
+        return cast_value
+
+    raise Step05Error(
+        f"unsupported correction image dtype: {dtype.name}."
+    )
+
+
+def apply_rts_correction_in_memory(
+    decision_result: RTSCorrectionDecisionResult,
+) -> RTSCorrectionApplicationResult:
+    """Apply correctable decisions to an independent in-memory image copy.
+
+    The source FITS file is opened read-only.  LOWER and UPPER decisions are
+    applied to a newly allocated array.  Rejected MIDPOINT and OUTSIDE
+    decisions preserve their original pixel values.
+    """
+    if not isinstance(decision_result, RTSCorrectionDecisionResult):
+        raise Step05Error(
+            "decision_result must be an RTSCorrectionDecisionResult."
+        )
+
+    plan = decision_result.plan
+    try:
+        with fits.open(
+            plan.input_path,
+            mode="readonly",
+            memmap=False,
+            do_not_scale_image_data=False,
+            uint=True,
+        ) as hdul:
+            data = hdul[0].data
+            if data is None or data.ndim != 2:
+                raise Step05Error(
+                    "input FITS primary image is no longer two-dimensional."
+                )
+
+            current_shape = tuple(int(value) for value in data.shape)
+            if current_shape != plan.image_shape:
+                raise Step05Error(
+                    "input FITS image_shape changed after plan preparation: "
+                    f"expected {plan.image_shape}, got {current_shape}."
+                )
+
+            corrected = np.array(data, copy=True)
+    except Step05Error:
+        raise
+    except (OSError, ValueError, TypeError) as exc:
+        raise Step05Error(
+            f"Could not read correction input FITS '{plan.input_path}': {exc}"
+        ) from exc
+
+    output_dtype = corrected.dtype
+    applied_count = 0
+    preserved_count = 0
+
+    for decision in decision_result.decisions:
+        row, column = decision.coordinate
+        current_value = float(corrected[row, column])
+
+        if not np.isclose(
+            current_value,
+            decision.current_value,
+            rtol=0.0,
+            atol=0.0,
+            equal_nan=False,
+        ):
+            raise Step05Error(
+                "input FITS candidate value changed after classification at "
+                f"{decision.coordinate}: expected {decision.current_value}, "
+                f"got {current_value}."
+            )
+
+        if decision.is_correctable:
+            if decision.target_value is None:
+                raise Step05Error(
+                    f"correctable decision has no target at {decision.coordinate}."
+                )
+            corrected[row, column] = _coerce_target_value_for_dtype(
+                decision.target_value,
+                output_dtype,
+                decision.coordinate,
+            )
+            applied_count += 1
+        else:
+            preserved_count += 1
+
+    return RTSCorrectionApplicationResult(
+        decision_result=decision_result,
+        corrected_image=corrected,
+        applied_count=applied_count,
+        preserved_count=preserved_count,
+        output_dtype=output_dtype.name,
     )
