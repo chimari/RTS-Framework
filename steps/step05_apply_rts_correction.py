@@ -1,7 +1,7 @@
 """Step 05: prepare deterministic RTS correction plans.
 
-Version 5.6.0 adds deterministic batch correction for multiple FITS inputs
-using one validated RTS dictionary metadata artifact.
+Version 5.7.0 adds a deterministic command-line interface for batch RTS
+correction with repeated inputs, input lists, and aggregate reporting.
 """
 
 from __future__ import annotations
@@ -32,7 +32,7 @@ from steps.step04_prepare_rts_dictionary_analysis import (
     validate_rts_dictionary_artifacts,
 )
 
-__version__ = "5.6.0"
+__version__ = "5.7.0"
 
 __all__ = [
     "RTSCandidateClassification",
@@ -53,6 +53,7 @@ __all__ = [
     "classify_rts_correction_candidates",
     "prepare_rts_correction",
     "run_rts_correction_batch",
+    "run_rts_correction_batch_cli",
     "run_rts_correction_cli",
     "write_rts_corrected_fits",
 ]
@@ -1501,3 +1502,189 @@ def run_rts_correction_cli(
 
 if __name__ == "__main__":
     raise SystemExit(run_rts_correction_cli())
+
+
+def _build_rts_correction_batch_cli_parser() -> argparse.ArgumentParser:
+    """Build the Step 05 batch command-line parser."""
+    parser = argparse.ArgumentParser(
+        prog="step05_apply_rts_correction_batch",
+        description=(
+            "Apply one validated RTS dictionary to multiple FITS images and "
+            "write verified corrected outputs."
+        ),
+    )
+    parser.add_argument(
+        "--metadata",
+        required=True,
+        help="Path to the Step 04 RTS dictionary metadata JSON.",
+    )
+    parser.add_argument(
+        "--input",
+        action="append",
+        default=[],
+        dest="input_paths",
+        help=(
+            "Input FITS path. Repeat this option for multiple inputs."
+        ),
+    )
+    parser.add_argument(
+        "--input-list",
+        dest="input_list",
+        help=(
+            "UTF-8 text file containing one input FITS path per line. "
+            "Blank lines and lines beginning with # are ignored."
+        ),
+    )
+    parser.add_argument(
+        "--output-directory",
+        required=True,
+        dest="output_directory",
+        help="Directory for corrected FITS outputs.",
+    )
+    parser.add_argument(
+        "--output-suffix",
+        default="_rts_corrected",
+        help="Suffix inserted before the FITS filename extension.",
+    )
+    parser.add_argument(
+        "--state-tolerance-fraction",
+        type=float,
+        default=0.25,
+        help=(
+            "Fraction of state separation used for LOWER/UPPER "
+            "classification tolerance (default: 0.25)."
+        ),
+    )
+    parser.add_argument(
+        "--overwrite",
+        action="store_true",
+        help="Allow replacement of existing output files.",
+    )
+    parser.add_argument(
+        "--continue-on-error",
+        action="store_true",
+        help="Record failed inputs and continue processing the batch.",
+    )
+    parser.add_argument(
+        "--quiet",
+        action="store_true",
+        help="Suppress human-readable output.",
+    )
+    parser.add_argument(
+        "--json",
+        action="store_true",
+        dest="json_output",
+        help="Write one machine-readable JSON summary to stdout.",
+    )
+    parser.add_argument(
+        "--version",
+        action="version",
+        version=f"%(prog)s {__version__}",
+    )
+    return parser
+
+
+def _read_rts_batch_input_list(path: str | Path) -> tuple[str, ...]:
+    """Read one deterministic UTF-8 batch input list."""
+    list_path = Path(path).expanduser().resolve()
+    try:
+        raw_lines = list_path.read_text(encoding="utf-8").splitlines()
+    except OSError as exc:
+        raise Step05Error(
+            f"Could not read input list '{list_path}': {exc}"
+        ) from exc
+
+    entries = tuple(
+        line.strip()
+        for line in raw_lines
+        if line.strip() and not line.lstrip().startswith("#")
+    )
+    if not entries:
+        raise Step05Error(
+            f"input list contains no usable paths: '{list_path}'."
+        )
+    return entries
+
+
+def run_rts_correction_batch_cli(
+    argv: list[str] | tuple[str, ...] | None = None,
+) -> int:
+    """Run the Step 05 batch correction CLI.
+
+    Exit codes:
+        0: every input succeeded
+        1: operational failure or one/more recorded input failures
+        2: command-line argument parsing failure from argparse
+    """
+    parser = _build_rts_correction_batch_cli_parser()
+    args = parser.parse_args(argv)
+
+    try:
+        combined_inputs = list(args.input_paths)
+        if args.input_list is not None:
+            combined_inputs.extend(
+                _read_rts_batch_input_list(args.input_list)
+            )
+        if not combined_inputs:
+            raise Step05Error(
+                "at least one --input or --input-list entry is required."
+            )
+
+        result = run_rts_correction_batch(
+            args.metadata,
+            combined_inputs,
+            args.output_directory,
+            output_suffix=args.output_suffix,
+            state_tolerance_fraction=args.state_tolerance_fraction,
+            overwrite=args.overwrite,
+            continue_on_error=args.continue_on_error,
+        )
+    except Step05Error as exc:
+        if args.json_output:
+            print(
+                json.dumps(
+                    {
+                        "step05_version": __version__,
+                        "status": "ERROR",
+                        "exit_code": 1,
+                        "error": str(exc),
+                    },
+                    sort_keys=True,
+                    separators=(",", ":"),
+                )
+            )
+        elif not args.quiet:
+            print(f"ERROR: {exc}", file=sys.stderr)
+        return 1
+
+    exit_code = 0 if result.all_succeeded else 1
+    summary = {
+        **result.summary(),
+        "status": "OK" if result.all_succeeded else "PARTIAL",
+        "exit_code": exit_code,
+    }
+
+    if args.json_output:
+        print(
+            json.dumps(
+                summary,
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+        )
+    elif not args.quiet:
+        print("RTS batch correction completed")
+        print(f"Metadata       : {result.metadata_path}")
+        print(f"Output dir     : {result.output_directory}")
+        print(f"Total          : {result.total_count}")
+        print(f"Succeeded      : {result.succeeded_count}")
+        print(f"Failed         : {result.failed_count}")
+        print(f"All succeeded  : {result.all_succeeded}")
+        for item in result.items:
+            status = "OK" if item.succeeded else "ERROR"
+            print(f"[{status}] {item.input_path} -> {item.output_path}")
+            if item.error is not None:
+                print(f"        {item.error}")
+
+    return exit_code
+
