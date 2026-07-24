@@ -1,6 +1,6 @@
 """Step 04: prepare an RTS dictionary analysis plan.
 
-Version 4.33.0 adds a minimal command-line input-audit interface
+Version 4.34.0 adds deterministic JSON summaries and CLI output
 while preserving all existing public APIs.
 """
 
@@ -17,7 +17,7 @@ import os
 import sys
 import tempfile
 
-__version__ = "4.33.0"
+__version__ = "4.34.0"
 
 from dataclasses import dataclass
 from enum import Enum
@@ -2246,6 +2246,33 @@ class RTSInputAuditResult:
         }
 
 
+    def to_json_summary(self, status=None) -> dict:
+        """Return the stable external JSON summary for this audit."""
+        if status is None:
+            status = evaluate_rts_input_audit(self)
+        if not isinstance(status, RTSAuditStatus):
+            raise Step04Error("status must be an RTSAuditStatus.")
+
+        return {
+            "status": status.name.value,
+            "ok": status.ok,
+            "exit_code": status.exit_code,
+            "message": status.message,
+            "changed_count": status.changed_count,
+            "missing_count": status.missing_count,
+            "additional_count": status.additional_count,
+            "metadata_json": str(
+                _normalized_artifact_path(self.metadata_path)
+            ),
+            "fingerprint_json": str(
+                _normalized_artifact_path(self.fingerprint_json_path)
+            ),
+            "comparison_json": str(
+                _normalized_artifact_path(self.comparison_json_path)
+            ),
+        }
+
+
 def audit_rts_dictionary_input_files(
     metadata,
     *,
@@ -2365,6 +2392,19 @@ class RTSAuditStatus:
             "name": self.name.value,
             "exit_code": self.exit_code,
             "ok": self.ok,
+            "message": self.message,
+            "changed_count": self.changed_count,
+            "missing_count": self.missing_count,
+            "additional_count": self.additional_count,
+        }
+
+
+    def to_json_summary(self) -> dict:
+        """Return the stable external JSON fields for this status."""
+        return {
+            "status": self.name.value,
+            "ok": self.ok,
+            "exit_code": self.exit_code,
             "message": self.message,
             "changed_count": self.changed_count,
             "missing_count": self.missing_count,
@@ -4312,10 +4352,16 @@ def _build_rts_input_audit_argument_parser():
         default=None,
         help="Optional output path for the comparison JSON.",
     )
-    parser.add_argument(
+    output_group = parser.add_mutually_exclusive_group()
+    output_group.add_argument(
         "--quiet",
         action="store_true",
         help="Suppress normal output and communicate only by exit code.",
+    )
+    output_group.add_argument(
+        "--json",
+        action="store_true",
+        help="Write one deterministic JSON object to standard output.",
     )
     parser.add_argument(
         "--version",
@@ -4341,6 +4387,22 @@ def _write_rts_input_audit_cli_report(
         f"Comparison JSON  : {audit.comparison_json_path}",
         file=stream,
     )
+
+
+
+def _write_rts_input_audit_cli_json(
+    audit: RTSInputAuditResult,
+    status: RTSAuditStatus,
+    stream,
+) -> None:
+    """Write one deterministic machine-readable audit object."""
+    json.dump(
+        audit.to_json_summary(status),
+        stream,
+        ensure_ascii=False,
+        indent=2,
+    )
+    stream.write("\n")
 
 
 def run_rts_input_audit_cli(
@@ -4380,7 +4442,13 @@ def run_rts_input_audit_cli(
             print(f"RTS input audit error: {exc}", file=error_stream)
         return 64
 
-    if not namespace.quiet:
+    if namespace.json:
+        _write_rts_input_audit_cli_json(
+            audit,
+            status,
+            output_stream,
+        )
+    elif not namespace.quiet:
         _write_rts_input_audit_cli_report(
             audit,
             status,
