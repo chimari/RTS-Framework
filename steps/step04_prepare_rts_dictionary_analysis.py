@@ -1,12 +1,12 @@
 """Step 04: prepare an RTS dictionary analysis plan.
 
-Version 4.7.0 adds a thin single-pixel orchestration layer that composes the
-existing loading, statistics, scoring, candidate, and transition APIs.
+Version 4.8.0 adds deterministic lazy iteration over explicitly supplied
+pixel coordinates while reusing the existing one-pixel orchestration API.
 """
 
 from __future__ import annotations
 
-__version__ = "4.7.0"
+__version__ = "4.8.0"
 
 from dataclasses import dataclass
 
@@ -35,6 +35,7 @@ __all__ = [
     "classify_temporal_rts_candidate",
     "compute_pixel_timeseries_statistics",
     "compute_two_state_score",
+    "iter_rts_pixel_analyses",
     "load_pixel_timeseries",
     "prepare_rts_dictionary_analysis",
 ]
@@ -335,6 +336,84 @@ class RTSDictionaryPlan:
 
 
 
+
+
+def iter_rts_pixel_analyses(
+    plan: RTSDictionaryPlan,
+    coordinates: object,
+    *,
+    minimum_score: float,
+    minimum_state_count: int,
+    minimum_separation: float,
+    minimum_transition_count: int,
+    minimum_lower_run: int,
+    minimum_upper_run: int,
+):
+    """Yield one-pixel RTS analyses in the exact supplied coordinate order.
+
+    This function is intentionally lazy and delegates every pixel to
+    :func:`analyze_rts_pixel`. Duplicate coordinates are preserved and analyzed
+    again. No sorting, de-duplication, full-frame expansion, caching,
+    multiprocessing, progress reporting, or output serialization is performed.
+
+    Parameters
+    ----------
+    plan
+        Plan returned by :func:`prepare_rts_dictionary_analysis`.
+    coordinates
+        An iterable of ``(row, column)`` coordinate pairs. Each pair must be a
+        two-item tuple or list whose values are integer coordinates. Boolean
+        values are rejected even though ``bool`` is a subclass of ``int``.
+    minimum_score, minimum_state_count, minimum_separation
+        Thresholds forwarded unchanged to :func:`analyze_rts_pixel`.
+    minimum_transition_count, minimum_lower_run, minimum_upper_run
+        Temporal thresholds forwarded unchanged to :func:`analyze_rts_pixel`.
+
+    Yields
+    ------
+    RTSPixelAnalysisResult
+        Results in exactly the same order as the supplied coordinates.
+
+    Raises
+    ------
+    Step04Error
+        When ``coordinates`` is not iterable, a coordinate item is malformed,
+        or an underlying one-pixel analysis fails. Validation occurs lazily as
+        each coordinate is requested.
+    """
+    try:
+        iterator = iter(coordinates)
+    except TypeError as exc:
+        raise Step04Error("coordinates must be an iterable of (row, column) pairs.") from exc
+
+    for coordinate_index, coordinate in enumerate(iterator):
+        if not isinstance(coordinate, (tuple, list)) or len(coordinate) != 2:
+            raise Step04Error(
+                f"coordinates[{coordinate_index}] must be a two-item "
+                "(row, column) tuple or list."
+            )
+
+        row, column = coordinate
+        if isinstance(row, bool) or not isinstance(row, (int, np.integer)):
+            raise Step04Error(
+                f"coordinates[{coordinate_index}][0] row must be an integer."
+            )
+        if isinstance(column, bool) or not isinstance(column, (int, np.integer)):
+            raise Step04Error(
+                f"coordinates[{coordinate_index}][1] column must be an integer."
+            )
+
+        yield analyze_rts_pixel(
+            plan,
+            row=int(row),
+            column=int(column),
+            minimum_score=minimum_score,
+            minimum_state_count=minimum_state_count,
+            minimum_separation=minimum_separation,
+            minimum_transition_count=minimum_transition_count,
+            minimum_lower_run=minimum_lower_run,
+            minimum_upper_run=minimum_upper_run,
+        )
 
 def analyze_rts_pixel(
     plan: RTSDictionaryPlan,
