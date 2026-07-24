@@ -1,7 +1,7 @@
 """Step 04: prepare an RTS dictionary analysis plan.
 
-Version 4.18.0 adds immutable timed progress state and a callback adapter
-without changing the existing integer progress notification contract.
+Version 4.19.0 adds cooperative cancellation to the high-level dictionary
+build APIs while preserving atomic output and existing analysis behavior.
 """
 
 from __future__ import annotations
@@ -13,7 +13,7 @@ import csv
 import os
 import tempfile
 
-__version__ = "4.18.0"
+__version__ = "4.19.0"
 
 from dataclasses import dataclass
 
@@ -32,6 +32,7 @@ __all__ = [
     "RTSCandidateResult",
     "RTSDictionaryBuildResult",
     "RTSProgressState",
+    "Step04Cancelled",
     "RTSDictionaryPlan",
     "RTSPixelAnalysisResult",
     "Step04Error",
@@ -61,6 +62,11 @@ __all__ = [
 
 class Step04Error(Exception):
     """Raised when Step 04 cannot prepare an RTS dictionary analysis."""
+
+
+
+class Step04Cancelled(Step04Error):
+    """Raised when cooperative Step 04 cancellation is requested."""
 
 
 
@@ -668,6 +674,7 @@ def build_rts_dictionary_csv(
     minimum_lower_run: int = 1,
     minimum_upper_run: int = 1,
     progress_callback=None,
+    cancel_requested=None,
 ) -> Path:
     """Analyze an image region and atomically write its final RTS candidates.
 
@@ -689,6 +696,7 @@ def build_rts_dictionary_csv(
         minimum_lower_run=minimum_lower_run,
         minimum_upper_run=minimum_upper_run,
         progress_callback=progress_callback,
+        cancel_requested=cancel_requested,
     )
     return result.output_path
 
@@ -708,6 +716,7 @@ def build_rts_dictionary_csv_result(
     minimum_lower_run: int = 1,
     minimum_upper_run: int = 1,
     progress_callback=None,
+    cancel_requested=None,
 ) -> RTSDictionaryBuildResult:
     """Build an RTS dictionary CSV and return immutable execution metadata.
 
@@ -739,6 +748,25 @@ def build_rts_dictionary_csv_result(
 
     if progress_callback is not None and not callable(progress_callback):
         raise Step04Error("progress_callback must be callable or None.")
+    if cancel_requested is not None and not callable(cancel_requested):
+        raise Step04Error("cancel_requested must be callable or None.")
+
+    def check_cancellation(completed: int) -> None:
+        if cancel_requested is None:
+            return
+        try:
+            requested = cancel_requested()
+        except Exception as exc:
+            raise Step04Error(
+                f"cancel_requested failed after {completed} completed pixels: {exc}"
+            ) from exc
+        if not isinstance(requested, bool):
+            raise Step04Error("cancel_requested must return bool.")
+        if requested:
+            raise Step04Cancelled(
+                f"RTS dictionary build cancelled after "
+                f"{completed} completed pixels."
+            )
 
     total_pixel_count = (
         (resolved_row_stop - resolved_row_start)
@@ -756,6 +784,7 @@ def build_rts_dictionary_csv_result(
                 f"{total_pixel_count}: {exc}"
             ) from exc
 
+    check_cancellation(0)
     notify_progress(0)
 
     analyzed_pixel_count = 0
@@ -777,7 +806,13 @@ def build_rts_dictionary_csv_result(
 
     def counted_analyses():
         nonlocal analyzed_pixel_count
-        for analysis in analyses:
+        iterator = iter(analyses)
+        while True:
+            check_cancellation(analyzed_pixel_count)
+            try:
+                analysis = next(iterator)
+            except StopIteration:
+                break
             analyzed_pixel_count += 1
             notify_progress(analyzed_pixel_count)
             yield analysis
