@@ -1,7 +1,7 @@
 """Step 04: prepare an RTS dictionary analysis plan.
 
-Version 4.28.0 adds deterministic atomic JSON persistence and validated
-loading for input-file fingerprints while preserving existing APIs.
+Version 4.29.0 adds deterministic comparison of saved fingerprints with
+current input files while preserving all existing public APIs.
 """
 
 from __future__ import annotations
@@ -15,7 +15,7 @@ import json
 import os
 import tempfile
 
-__version__ = "4.28.0"
+__version__ = "4.29.0"
 
 from dataclasses import dataclass
 
@@ -41,6 +41,8 @@ __all__ = [
     "RTSInputFileValidation",
     "RTSInputFileFingerprint",
     "RTSInputFileFingerprintSet",
+    "RTSInputFileFingerprintChange",
+    "RTSInputFileFingerprintComparison",
     "RTSProgressState",
     "RTSCancellationInfo",
     "RTSDictionaryBuildParameters",
@@ -75,6 +77,7 @@ __all__ = [
     "fingerprint_rts_dictionary_input_files",
     "write_rts_input_file_fingerprints_json",
     "load_rts_input_file_fingerprints_json",
+    "compare_rts_input_file_fingerprints",
     "build_rts_dictionary_artifacts",
     "build_rts_dictionary_csv",
     "build_rts_dictionary_csv_result",
@@ -694,6 +697,86 @@ class RTSInputFileFingerprintSet:
             "file_count": self.file_count,
             "total_size_bytes": self.total_size_bytes,
             "files": tuple(item.summary() for item in self.files),
+        }
+
+
+
+@dataclass(slots=True, frozen=True)
+class RTSInputFileFingerprintChange:
+    """Immutable comparison record for one changed or missing file."""
+
+    index: int
+    path: Path
+    expected_size_bytes: int
+    current_size_bytes: int | None
+    expected_sha256: str
+    current_sha256: str | None
+    status: str
+
+    def summary(self) -> dict[str, object]:
+        """Return a deterministic JSON-serializable change summary."""
+        return {
+            "index": self.index,
+            "path": str(self.path),
+            "expected_size_bytes": self.expected_size_bytes,
+            "current_size_bytes": self.current_size_bytes,
+            "expected_sha256": self.expected_sha256,
+            "current_sha256": self.current_sha256,
+            "status": self.status,
+        }
+
+
+@dataclass(slots=True, frozen=True)
+class RTSInputFileFingerprintComparison:
+    """Immutable audit result comparing saved and current fingerprints."""
+
+    metadata_path: Path
+    algorithm: str
+    expected_file_count: int
+    current_file_count: int
+    unchanged_indices: tuple[int, ...]
+    changes: tuple[RTSInputFileFingerprintChange, ...]
+    additional_paths: tuple[Path, ...]
+
+    @property
+    def unchanged_count(self) -> int:
+        return len(self.unchanged_indices)
+
+    @property
+    def changed_count(self) -> int:
+        return sum(change.status == "changed" for change in self.changes)
+
+    @property
+    def missing_count(self) -> int:
+        return sum(change.status == "missing" for change in self.changes)
+
+    @property
+    def additional_count(self) -> int:
+        return len(self.additional_paths)
+
+    @property
+    def matches(self) -> bool:
+        return (
+            not self.changes
+            and not self.additional_paths
+            and self.expected_file_count == self.current_file_count
+        )
+
+    def summary(self) -> dict[str, object]:
+        """Return a deterministic JSON-serializable comparison summary."""
+        return {
+            "metadata_path": str(self.metadata_path),
+            "algorithm": self.algorithm,
+            "expected_file_count": self.expected_file_count,
+            "current_file_count": self.current_file_count,
+            "unchanged_count": self.unchanged_count,
+            "changed_count": self.changed_count,
+            "missing_count": self.missing_count,
+            "additional_count": self.additional_count,
+            "matches": self.matches,
+            "unchanged_indices": self.unchanged_indices,
+            "changes": tuple(change.summary() for change in self.changes),
+            "additional_paths": tuple(str(path) for path in self.additional_paths),
         }
 
 
@@ -1972,6 +2055,105 @@ def load_rts_input_file_fingerprints_json(
         metadata_path=metadata_path,
         algorithm=algorithm,
         files=tuple(files),
+    )
+
+
+
+
+def compare_rts_input_file_fingerprints(
+    expected,
+    current_metadata=None,
+) -> RTSInputFileFingerprintComparison:
+    """Compare saved fingerprints with the current input-file state.
+
+    ``expected`` may be an :class:`RTSInputFileFingerprintSet` or its JSON
+    path. ``current_metadata`` may be an :class:`RTSDictionaryMetadata`, a
+    metadata JSON path, or ``None``. When omitted, the metadata path stored in
+    the expected fingerprint inventory is used.
+
+    Files present in the current metadata but absent from the saved inventory
+    are reported as ``additional_paths``. Expected files that no longer exist
+    are reported with status ``missing``. Size or SHA-256 differences are
+    reported with status ``changed``.
+    """
+    if isinstance(expected, RTSInputFileFingerprintSet):
+        expected_set = expected
+    else:
+        expected_set = load_rts_input_file_fingerprints_json(expected)
+
+    if current_metadata is None:
+        metadata = load_rts_dictionary_metadata_json(
+            expected_set.metadata_path
+        )
+    elif isinstance(current_metadata, RTSDictionaryMetadata):
+        metadata = current_metadata
+    else:
+        metadata = load_rts_dictionary_metadata_json(current_metadata)
+
+    current_paths = tuple(
+        _normalized_artifact_path(path)
+        for path in metadata.filepaths
+    )
+    current_path_set = set(current_paths)
+    expected_path_set = {item.path for item in expected_set.files}
+
+    unchanged_indices: list[int] = []
+    changes: list[RTSInputFileFingerprintChange] = []
+
+    for item in expected_set.files:
+        path = item.path
+        if not path.is_file():
+            changes.append(
+                RTSInputFileFingerprintChange(
+                    index=item.index,
+                    path=path,
+                    expected_size_bytes=item.size_bytes,
+                    current_size_bytes=None,
+                    expected_sha256=item.sha256,
+                    current_sha256=None,
+                    status="missing",
+                )
+            )
+            continue
+
+        try:
+            current_size = path.stat().st_size
+        except OSError as exc:
+            raise Step04Error(
+                f"Could not stat input file '{path}': {exc}"
+            ) from exc
+        current_digest = _sha256_file(path)
+
+        if (
+            current_size == item.size_bytes
+            and current_digest == item.sha256
+        ):
+            unchanged_indices.append(item.index)
+        else:
+            changes.append(
+                RTSInputFileFingerprintChange(
+                    index=item.index,
+                    path=path,
+                    expected_size_bytes=item.size_bytes,
+                    current_size_bytes=current_size,
+                    expected_sha256=item.sha256,
+                    current_sha256=current_digest,
+                    status="changed",
+                )
+            )
+
+    additional_paths = tuple(
+        path for path in current_paths if path not in expected_path_set
+    )
+
+    return RTSInputFileFingerprintComparison(
+        metadata_path=metadata.metadata_path,
+        algorithm=expected_set.algorithm,
+        expected_file_count=expected_set.file_count,
+        current_file_count=len(current_paths),
+        unchanged_indices=tuple(unchanged_indices),
+        changes=tuple(changes),
+        additional_paths=additional_paths,
     )
 
 
