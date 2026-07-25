@@ -17,7 +17,7 @@ import os
 import sys
 import tempfile
 
-__version__ = "4.37.0"
+__version__ = "4.39.0"
 
 from dataclasses import dataclass
 from enum import Enum
@@ -3621,23 +3621,78 @@ def iter_image_rts_analyses(
         Propagated unchanged and lazily from coordinate generation or one-pixel
         analysis.
     """
-    coordinates = iter_image_coordinates(
+    # Preserve the original lazy validation contract.  In particular, an
+    # invalid plan must raise Step04Error from iter_image_coordinates() when
+    # iteration begins, rather than leaking AttributeError here.
+    validation_iterator = iter_image_coordinates(
         plan,
         row_start=row_start,
         row_stop=row_stop,
         column_start=column_start,
         column_stop=column_stop,
     )
-    yield from iter_rts_pixel_analyses(
+    if next(validation_iterator, None) is None:
+        return
+
+    height, width = plan.image_shape
+    resolved_row_stop = height if row_stop is None else row_stop
+    resolved_column_stop = width if column_stop is None else column_stop
+
+    # A float64 ROI stack avoids reopening and copying every frame once per
+    # pixel. Very large regions retain the legacy lazy implementation until
+    # tile-based processing is introduced.
+    roi_height = resolved_row_stop - row_start
+    roi_width = resolved_column_stop - column_start
+    estimated_stack_bytes = plan.n_frames * roi_height * roi_width * 8
+    maximum_stack_bytes = 1024 * 1024 * 1024
+
+    if estimated_stack_bytes > maximum_stack_bytes:
+        coordinates = iter_image_coordinates(
+            plan,
+            row_start=row_start,
+            row_stop=resolved_row_stop,
+            column_start=column_start,
+            column_stop=resolved_column_stop,
+        )
+        yield from iter_rts_pixel_analyses(
+            plan,
+            coordinates,
+            minimum_score=minimum_score,
+            minimum_state_count=minimum_state_count,
+            minimum_separation=minimum_separation,
+            minimum_transition_count=minimum_transition_count,
+            minimum_lower_run=minimum_lower_run,
+            minimum_upper_run=minimum_upper_run,
+        )
+        return
+
+    stack = _load_roi_stack(
         plan,
-        coordinates,
-        minimum_score=minimum_score,
-        minimum_state_count=minimum_state_count,
-        minimum_separation=minimum_separation,
-        minimum_transition_count=minimum_transition_count,
-        minimum_lower_run=minimum_lower_run,
-        minimum_upper_run=minimum_upper_run,
+        row_start=row_start,
+        row_stop=resolved_row_stop,
+        column_start=column_start,
+        column_stop=resolved_column_stop,
     )
+
+    for row in range(row_start, resolved_row_stop):
+        for column in range(column_start, resolved_column_stop):
+            series = _pixel_timeseries_from_roi_stack(
+                plan,
+                stack,
+                row=row,
+                column=column,
+                row_start=row_start,
+                column_start=column_start,
+            )
+            yield _analyze_rts_series(
+                series,
+                minimum_score=minimum_score,
+                minimum_state_count=minimum_state_count,
+                minimum_separation=minimum_separation,
+                minimum_transition_count=minimum_transition_count,
+                minimum_lower_run=minimum_lower_run,
+                minimum_upper_run=minimum_upper_run,
+            )
 
 def iter_rts_pixel_analyses(
     plan: RTSDictionaryPlan,
@@ -3716,6 +3771,43 @@ def iter_rts_pixel_analyses(
             minimum_upper_run=minimum_upper_run,
         )
 
+def _analyze_rts_series(
+    series: PixelTimeSeries,
+    *,
+    minimum_score: float,
+    minimum_state_count: int,
+    minimum_separation: float,
+    minimum_transition_count: int,
+    minimum_lower_run: int,
+    minimum_upper_run: int,
+) -> RTSPixelAnalysisResult:
+    """Run the canonical RTS analysis pipeline for one loaded time series."""
+    statistics = compute_pixel_timeseries_statistics(series)
+    score = compute_two_state_score(series)
+    candidate = classify_rts_candidate(
+        score,
+        minimum_score=minimum_score,
+        minimum_state_count=minimum_state_count,
+        minimum_separation=minimum_separation,
+    )
+    transitions = analyze_two_state_transitions(series, score)
+    temporal_candidate = classify_temporal_rts_candidate(
+        candidate,
+        transitions,
+        minimum_transition_count=minimum_transition_count,
+        minimum_lower_run=minimum_lower_run,
+        minimum_upper_run=minimum_upper_run,
+    )
+    return RTSPixelAnalysisResult(
+        series=series,
+        statistics=statistics,
+        score=score,
+        candidate=candidate,
+        transitions=transitions,
+        temporal_candidate=temporal_candidate,
+    )
+
+
 def analyze_rts_pixel(
     plan: RTSDictionaryPlan,
     *,
@@ -3763,30 +3855,14 @@ def analyze_rts_pixel(
         Propagated unchanged from the underlying public APIs.
     """
     series = load_pixel_timeseries(plan, row=row, column=column)
-    statistics = compute_pixel_timeseries_statistics(series)
-    score = compute_two_state_score(series)
-    candidate = classify_rts_candidate(
-        score,
+    return _analyze_rts_series(
+        series,
         minimum_score=minimum_score,
         minimum_state_count=minimum_state_count,
         minimum_separation=minimum_separation,
-    )
-    transitions = analyze_two_state_transitions(series, score)
-    temporal_candidate = classify_temporal_rts_candidate(
-        candidate,
-        transitions,
         minimum_transition_count=minimum_transition_count,
         minimum_lower_run=minimum_lower_run,
         minimum_upper_run=minimum_upper_run,
-    )
-
-    return RTSPixelAnalysisResult(
-        series=series,
-        statistics=statistics,
-        score=score,
-        candidate=candidate,
-        transitions=transitions,
-        temporal_candidate=temporal_candidate,
     )
 
 def classify_temporal_rts_candidate(
@@ -4355,6 +4431,110 @@ def compute_pixel_timeseries_statistics(
         median_absolute_deviation=median_absolute_deviation,
         peak_to_peak=maximum - minimum,
     )
+
+def _load_roi_stack(
+    plan: RTSDictionaryPlan,
+    *,
+    row_start: int,
+    row_stop: int,
+    column_start: int,
+    column_stop: int,
+) -> np.ndarray:
+    """Load the selected ROI from every bias frame into a float32 stack."""
+    if not isinstance(plan, RTSDictionaryPlan):
+        raise Step04Error(
+            "plan must be an RTSDictionaryPlan returned by "
+            "prepare_rts_dictionary_analysis()."
+        )
+
+    roi_height = row_stop - row_start
+    roi_width = column_stop - column_start
+
+    stack = np.empty(
+        (
+            plan.n_frames,
+            roi_height,
+            roi_width,
+        ),
+        dtype=np.float32,
+    )
+
+    count = 0
+
+    try:
+        for image in iter_bias_frames(plan.bias_plan):
+            if count >= plan.n_frames:
+                raise Step04Error(
+                    f"Dataset {plan.dataset!r} yielded more than "
+                    f"{plan.n_frames} frame(s)."
+                )
+
+            if image.shape != plan.image_shape:
+                raise Step04Error(
+                    f"Bias frame {count} has shape {image.shape!r}; "
+                    f"expected {plan.image_shape!r}."
+                )
+
+            roi = image[
+                row_start:row_stop,
+                column_start:column_stop,
+            ]
+
+            if roi.shape != (roi_height, roi_width):
+                raise Step04Error(
+                    f"Bias frame {count} produced ROI shape {roi.shape!r}; "
+                    f"expected {(roi_height, roi_width)!r}."
+                )
+
+            stack[count] = np.asarray(
+                roi,
+                dtype=np.float32,
+            )
+
+            count += 1
+
+    except Step04Error:
+        raise
+    except Exception as exc:
+        raise Step04Error(
+            f"Unable to load ROI stack for dataset {plan.dataset!r}: {exc}"
+        ) from exc
+
+    if count != plan.n_frames:
+        raise Step04Error(
+            f"Dataset {plan.dataset!r} yielded {count} frame(s); "
+            f"expected {plan.n_frames}."
+        )
+
+    stack.setflags(write=False)
+    return stack
+
+def _pixel_timeseries_from_roi_stack(
+    plan: RTSDictionaryPlan,
+    stack: np.ndarray,
+    *,
+    row: int,
+    column: int,
+    row_start: int,
+    column_start: int,
+) -> PixelTimeSeries:
+    """Construct one canonical time series from an in-memory ROI stack."""
+    values = np.array(
+        stack[:, row - row_start, column - column_start],
+        dtype=np.float64,
+        order="C",
+        copy=True,
+    )
+    values.setflags(write=False)
+    return PixelTimeSeries(
+        plan=plan,
+        dataset=plan.dataset,
+        row=row,
+        column=column,
+        n_frames=plan.n_frames,
+        values=values,
+    )
+
 
 def load_pixel_timeseries(
     plan: RTSDictionaryPlan,
