@@ -1,7 +1,7 @@
 """Step 05: prepare deterministic RTS correction plans.
 
-Version 5.9.0 adds deterministic correction provenance with environment,
-configuration, and complete input/output artifact hashes.
+Version 5.12.0 adds deterministic multiprocessing for independent FITS inputs
+while preserving input order and parent-process manifest/provenance aggregation.
 """
 
 from __future__ import annotations
@@ -11,10 +11,12 @@ from enum import Enum
 from pathlib import Path
 import argparse
 import csv
+from concurrent.futures import ProcessPoolExecutor
 import datetime
 import hashlib
 import io
 import json
+import os
 import platform
 import sys
 
@@ -36,7 +38,7 @@ from steps.step04_prepare_rts_dictionary_analysis import (
     validate_rts_dictionary_artifacts,
 )
 
-__version__ = "5.9.0"
+__version__ = "5.12.0"
 
 __all__ = [
     "RTSCandidateClassification",
@@ -51,11 +53,16 @@ __all__ = [
     "RTSCorrectionBatchResult",
     "RTSCorrectionOutput",
     "RTSCorrectionPlan",
+    "RTSCorrectionPreflightIssue",
+    "RTSCorrectionPreflightItem",
+    "RTSCorrectionBatchValidation",
     "Step05Error",
     "apply_rts_correction_in_memory",
     "build_rts_correction_decisions",
     "classify_rts_correction_candidates",
     "prepare_rts_correction",
+    "validate_rts_correction_batch",
+    "discover_rts_batch_inputs",
     "run_rts_correction_batch",
     "run_rts_correction_batch_cli",
     "write_rts_batch_manifest_csv",
@@ -525,6 +532,104 @@ class RTSCorrectionBatchResult:
             "succeeded_count": self.succeeded_count,
             "failed_count": self.failed_count,
             "all_succeeded": self.all_succeeded,
+            "items": tuple(item.summary() for item in self.items),
+        }
+
+
+@dataclass(slots=True, frozen=True)
+class RTSCorrectionPreflightIssue:
+    """One deterministic issue found during batch preflight validation."""
+
+    code: str
+    message: str
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.code, str) or not self.code:
+            raise Step05Error("preflight issue code must be a non-empty string.")
+        if not isinstance(self.message, str) or not self.message:
+            raise Step05Error("preflight issue message must be a non-empty string.")
+
+    def summary(self) -> dict[str, object]:
+        return {"code": self.code, "message": self.message}
+
+
+@dataclass(slots=True, frozen=True)
+class RTSCorrectionPreflightItem:
+    """Immutable validation result for one requested batch input."""
+
+    input_path: Path
+    output_path: Path
+    image_shape: tuple[int, int] | None
+    pixel_dtype: str | None
+    issues: tuple[RTSCorrectionPreflightIssue, ...]
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "input_path", _normalized_path(self.input_path))
+        object.__setattr__(self, "output_path", _normalized_path(self.output_path))
+
+    @property
+    def is_valid(self) -> bool:
+        return not self.issues
+
+    def summary(self) -> dict[str, object]:
+        return {
+            "input_path": str(self.input_path),
+            "output_path": str(self.output_path),
+            "is_valid": self.is_valid,
+            "image_shape": self.image_shape,
+            "pixel_dtype": self.pixel_dtype,
+            "issues": tuple(issue.summary() for issue in self.issues),
+        }
+
+
+@dataclass(slots=True, frozen=True)
+class RTSCorrectionBatchValidation:
+    """Immutable aggregate batch preflight result."""
+
+    metadata_path: Path
+    output_directory: Path
+    output_suffix: str
+    overwrite: bool
+    expected_image_shape: tuple[int, int] | None
+    artifact_issues: tuple[RTSCorrectionPreflightIssue, ...]
+    items: tuple[RTSCorrectionPreflightItem, ...]
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "metadata_path", _normalized_path(self.metadata_path))
+        object.__setattr__(self, "output_directory", _normalized_path(self.output_directory))
+        if not self.items:
+            raise Step05Error("preflight result must contain at least one item.")
+
+    @property
+    def error_count(self) -> int:
+        return len(self.artifact_issues) + sum(len(item.issues) for item in self.items)
+
+    @property
+    def valid_item_count(self) -> int:
+        return sum(item.is_valid for item in self.items)
+
+    @property
+    def invalid_item_count(self) -> int:
+        return len(self.items) - self.valid_item_count
+
+    @property
+    def is_valid(self) -> bool:
+        return self.error_count == 0
+
+    def summary(self) -> dict[str, object]:
+        return {
+            "step05_version": __version__,
+            "metadata_path": str(self.metadata_path),
+            "output_directory": str(self.output_directory),
+            "output_suffix": self.output_suffix,
+            "overwrite": self.overwrite,
+            "expected_image_shape": self.expected_image_shape,
+            "total_count": len(self.items),
+            "valid_item_count": self.valid_item_count,
+            "invalid_item_count": self.invalid_item_count,
+            "error_count": self.error_count,
+            "is_valid": self.is_valid,
+            "artifact_issues": tuple(issue.summary() for issue in self.artifact_issues),
             "items": tuple(item.summary() for item in self.items),
         }
 
@@ -1254,6 +1359,153 @@ def write_rts_corrected_fits(
 
 
 
+def validate_rts_correction_batch(
+    metadata_path: str | Path,
+    input_paths: list[str | Path] | tuple[str | Path, ...],
+    output_directory: str | Path,
+    *,
+    output_suffix: str = "_rts_corrected",
+    overwrite: bool = False,
+) -> RTSCorrectionBatchValidation:
+    """Validate a complete correction batch without writing any artifacts."""
+    metadata = _normalized_path(metadata_path)
+    destination_dir = _normalized_path(output_directory)
+    if not isinstance(input_paths, (list, tuple)) or not input_paths:
+        raise Step05Error("input_paths must be a non-empty list or tuple.")
+    if not isinstance(output_suffix, str) or not output_suffix:
+        raise Step05Error("output_suffix must be a non-empty string.")
+    if "/" in output_suffix or "\\" in output_suffix:
+        raise Step05Error("output_suffix must not contain path separators.")
+    if not isinstance(overwrite, bool):
+        raise Step05Error("overwrite must be a bool.")
+
+    artifact_issues: list[RTSCorrectionPreflightIssue] = []
+    expected_shape: tuple[int, int] | None = None
+    try:
+        validation = validate_rts_dictionary_artifacts(metadata)
+        expected_shape = validation.artifacts.metadata.image_shape
+    except Step04Error as exc:
+        artifact_issues.append(RTSCorrectionPreflightIssue(
+            "INVALID_ARTIFACTS",
+            f"Could not validate Step 04 dictionary artifacts: {exc}",
+        ))
+
+    directory_issue: RTSCorrectionPreflightIssue | None = None
+    if not destination_dir.exists():
+        directory_issue = RTSCorrectionPreflightIssue(
+            "OUTPUT_DIRECTORY_MISSING",
+            f"output directory does not exist: '{destination_dir}'.",
+        )
+    elif not destination_dir.is_dir():
+        directory_issue = RTSCorrectionPreflightIssue(
+            "OUTPUT_NOT_DIRECTORY",
+            f"output path is not a directory: '{destination_dir}'.",
+        )
+    elif not os.access(destination_dir, os.W_OK):
+        directory_issue = RTSCorrectionPreflightIssue(
+            "OUTPUT_DIRECTORY_NOT_WRITABLE",
+            f"output directory is not writable: '{destination_dir}'.",
+        )
+
+    normalized_inputs = tuple(_normalized_path(path) for path in input_paths)
+    input_counts = {path: normalized_inputs.count(path) for path in set(normalized_inputs)}
+    output_paths = tuple(
+        destination_dir / f"{path.stem}{output_suffix}{path.suffix}"
+        for path in normalized_inputs
+    )
+    output_counts = {path: output_paths.count(path) for path in set(output_paths)}
+
+    items: list[RTSCorrectionPreflightItem] = []
+    for input_path, output_path in zip(normalized_inputs, output_paths, strict=True):
+        issues: list[RTSCorrectionPreflightIssue] = []
+        if directory_issue is not None:
+            issues.append(directory_issue)
+        if input_counts[input_path] > 1:
+            issues.append(RTSCorrectionPreflightIssue(
+                "DUPLICATE_INPUT",
+                f"input path appears more than once: '{input_path}'.",
+            ))
+        if output_counts[output_path] > 1:
+            issues.append(RTSCorrectionPreflightIssue(
+                "OUTPUT_COLLISION",
+                f"multiple inputs map to the same output: '{output_path}'.",
+            ))
+        if output_path == input_path:
+            issues.append(RTSCorrectionPreflightIssue(
+                "OUTPUT_EQUALS_INPUT",
+                f"output path must not equal input path: '{input_path}'.",
+            ))
+        if output_path.exists() and not overwrite:
+            issues.append(RTSCorrectionPreflightIssue(
+                "OUTPUT_EXISTS",
+                f"output already exists and overwrite is False: '{output_path}'.",
+            ))
+
+        image_shape: tuple[int, int] | None = None
+        pixel_dtype: str | None = None
+        try:
+            image_shape, pixel_dtype = _load_primary_image_metadata(input_path)
+            if expected_shape is not None and image_shape != expected_shape:
+                issues.append(RTSCorrectionPreflightIssue(
+                    "SHAPE_MISMATCH",
+                    "input FITS image_shape does not match dictionary metadata: "
+                    f"expected {expected_shape}, got {image_shape}.",
+                ))
+        except Step05Error as exc:
+            issues.append(RTSCorrectionPreflightIssue("INVALID_INPUT", str(exc)))
+
+        items.append(RTSCorrectionPreflightItem(
+            input_path=input_path,
+            output_path=output_path,
+            image_shape=image_shape,
+            pixel_dtype=pixel_dtype,
+            issues=tuple(issues),
+        ))
+
+    return RTSCorrectionBatchValidation(
+        metadata_path=metadata,
+        output_directory=destination_dir,
+        output_suffix=output_suffix,
+        overwrite=overwrite,
+        expected_image_shape=expected_shape,
+        artifact_issues=tuple(artifact_issues),
+        items=tuple(items),
+    )
+
+
+def _run_rts_correction_batch_item_worker(
+    arguments: tuple[str, str, str, float, bool],
+) -> RTSCorrectionBatchItem:
+    """Run one independent correction item in a worker process."""
+    metadata_text, input_text, output_text, tolerance, overwrite = arguments
+    metadata = Path(metadata_text)
+    input_path = Path(input_text)
+    output_path = Path(output_text)
+    try:
+        plan = prepare_rts_correction(metadata, input_path)
+        classification = classify_rts_correction_candidates(
+            plan, state_tolerance_fraction=tolerance
+        )
+        decisions = build_rts_correction_decisions(classification)
+        application = apply_rts_correction_in_memory(decisions)
+        output = write_rts_corrected_fits(
+            application, output_path, overwrite=overwrite
+        )
+        return RTSCorrectionBatchItem(
+            input_path=input_path,
+            output_path=output_path,
+            succeeded=True,
+            output=output,
+        )
+    except Step05Error as exc:
+        return RTSCorrectionBatchItem(
+            input_path=input_path,
+            output_path=output_path,
+            succeeded=False,
+            error=str(exc),
+        )
+
+
 def run_rts_correction_batch(
     metadata_path: str | Path,
     input_paths: list[str | Path] | tuple[str | Path, ...],
@@ -1263,6 +1515,7 @@ def run_rts_correction_batch(
     state_tolerance_fraction: float = 0.25,
     overwrite: bool = False,
     continue_on_error: bool = False,
+    workers: int = 1,
 ) -> RTSCorrectionBatchResult:
     """Correct multiple FITS inputs using one RTS dictionary metadata file.
 
@@ -1271,6 +1524,11 @@ def run_rts_correction_batch(
 
     When continue_on_error is False, the first failure raises Step05Error.
     When True, failures are recorded and subsequent inputs continue.
+
+    workers=1 preserves the serial behavior. workers>1 uses independent
+    worker processes and preserves the original input order in the returned
+    result. Parallel mode requires continue_on_error=True so a worker failure
+    cannot leave ambiguous fail-fast semantics.
     """
     metadata = Path(metadata_path).expanduser().resolve()
     destination_dir = Path(output_directory).expanduser().resolve()
@@ -1285,6 +1543,12 @@ def run_rts_correction_batch(
         raise Step05Error("overwrite must be a bool.")
     if not isinstance(continue_on_error, bool):
         raise Step05Error("continue_on_error must be a bool.")
+    if isinstance(workers, bool) or not isinstance(workers, int) or workers < 1:
+        raise Step05Error("workers must be an integer greater than or equal to 1.")
+    if workers > 1 and not continue_on_error:
+        raise Step05Error(
+            "parallel batch mode requires continue_on_error=True."
+        )
     if not destination_dir.exists():
         raise Step05Error(
             f"output directory does not exist: '{destination_dir}'."
@@ -1302,51 +1566,41 @@ def run_rts_correction_batch(
 
     items: list[RTSCorrectionBatchItem] = []
     used_outputs: set[Path] = set()
+    work_items: list[tuple[str, str, str, float, bool]] = []
 
     for input_path in normalized_inputs:
-        output_name = (
-            f"{input_path.stem}{output_suffix}{input_path.suffix}"
-        )
+        output_name = f"{input_path.stem}{output_suffix}{input_path.suffix}"
         output_path = destination_dir / output_name
-
         if output_path in used_outputs:
             raise Step05Error(
                 f"multiple inputs map to the same output: '{output_path}'."
             )
         used_outputs.add(output_path)
+        work_items.append((
+            str(metadata),
+            str(input_path),
+            str(output_path),
+            state_tolerance_fraction,
+            overwrite,
+        ))
 
+    if workers == 1:
+        for work_item in work_items:
+            item = _run_rts_correction_batch_item_worker(work_item)
+            if not item.succeeded and not continue_on_error:
+                raise Step05Error(item.error or "batch item failed.")
+            items.append(item)
+    else:
         try:
-            plan = prepare_rts_correction(metadata, input_path)
-            classification = classify_rts_correction_candidates(
-                plan,
-                state_tolerance_fraction=state_tolerance_fraction,
-            )
-            decisions = build_rts_correction_decisions(classification)
-            application = apply_rts_correction_in_memory(decisions)
-            output = write_rts_corrected_fits(
-                application,
-                output_path,
-                overwrite=overwrite,
-            )
-            items.append(
-                RTSCorrectionBatchItem(
-                    input_path=input_path,
-                    output_path=output_path,
-                    succeeded=True,
-                    output=output,
-                )
-            )
-        except Step05Error as exc:
-            if not continue_on_error:
-                raise
-            items.append(
-                RTSCorrectionBatchItem(
-                    input_path=input_path,
-                    output_path=output_path,
-                    succeeded=False,
-                    error=str(exc),
-                )
-            )
+            with ProcessPoolExecutor(max_workers=workers) as executor:
+                # executor.map preserves the input ordering deterministically.
+                items.extend(executor.map(
+                    _run_rts_correction_batch_item_worker, work_items
+                ))
+        except (OSError, RuntimeError) as exc:
+            raise Step05Error(
+                f"parallel batch execution failed: {exc}"
+            ) from exc
 
     return RTSCorrectionBatchResult(
         metadata_path=metadata,
@@ -1884,6 +2138,24 @@ def _build_rts_correction_batch_cli_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--input-dir",
+        action="append",
+        default=[],
+        dest="input_directories",
+        help=(
+            "Directory containing input FITS files. Repeat for multiple "
+            "directories. Files are selected in deterministic sorted order."
+        ),
+    )
+    parser.add_argument(
+        "--pattern",
+        default="*.fits",
+        help=(
+            "Non-recursive glob pattern used with --input-dir "
+            "(default: *.fits)."
+        ),
+    )
+    parser.add_argument(
         "--output-directory",
         required=True,
         dest="output_directory",
@@ -1909,9 +2181,23 @@ def _build_rts_correction_batch_cli_parser() -> argparse.ArgumentParser:
         help="Allow replacement of existing output files.",
     )
     parser.add_argument(
+        "--preflight",
+        action="store_true",
+        help="Validate the complete batch without writing output artifacts.",
+    )
+    parser.add_argument(
         "--continue-on-error",
         action="store_true",
         help="Record failed inputs and continue processing the batch.",
+    )
+    parser.add_argument(
+        "--workers",
+        type=int,
+        default=1,
+        help=(
+            "Number of independent worker processes (default: 1). "
+            "Values greater than 1 require --continue-on-error."
+        ),
     )
     parser.add_argument(
         "--quiet",
@@ -1969,6 +2255,59 @@ def _read_rts_batch_input_list(path: str | Path) -> tuple[str, ...]:
     return entries
 
 
+
+def discover_rts_batch_inputs(
+    input_directories: list[str | Path] | tuple[str | Path, ...],
+    *,
+    pattern: str = "*.fits",
+) -> tuple[Path, ...]:
+    """Discover batch inputs from directories in deterministic order.
+
+    Discovery is non-recursive. Directories retain command-line order, and
+    matching regular files within each directory are sorted by filename.
+    Duplicate normalized paths across directories are rejected.
+    """
+    if not isinstance(input_directories, (list, tuple)):
+        raise Step05Error("input_directories must be a list or tuple.")
+    if not isinstance(pattern, str) or not pattern:
+        raise Step05Error("pattern must be a non-empty string.")
+    if Path(pattern).is_absolute():
+        raise Step05Error("pattern must be relative, not absolute.")
+
+    discovered: list[Path] = []
+    for raw_directory in input_directories:
+        directory = Path(raw_directory).expanduser().resolve()
+        if not directory.exists():
+            raise Step05Error(
+                f"input directory does not exist: '{directory}'."
+            )
+        if not directory.is_dir():
+            raise Step05Error(
+                f"input directory is not a directory: '{directory}'."
+            )
+        try:
+            matches = sorted(
+                (path.resolve() for path in directory.glob(pattern) if path.is_file()),
+                key=lambda path: path.name,
+            )
+        except (OSError, ValueError) as exc:
+            raise Step05Error(
+                f"Could not scan input directory '{directory}' with pattern "
+                f"'{pattern}': {exc}"
+            ) from exc
+        if not matches:
+            raise Step05Error(
+                f"no files matched pattern '{pattern}' in input directory "
+                f"'{directory}'."
+            )
+        discovered.extend(matches)
+
+    if len(set(discovered)) != len(discovered):
+        raise Step05Error(
+            "directory discovery produced duplicate input paths."
+        )
+    return tuple(discovered)
+
 def run_rts_correction_batch_cli(
     argv: list[str] | tuple[str, ...] | None = None,
 ) -> int:
@@ -1988,10 +2327,62 @@ def run_rts_correction_batch_cli(
             combined_inputs.extend(
                 _read_rts_batch_input_list(args.input_list)
             )
+        if args.input_directories:
+            combined_inputs.extend(
+                discover_rts_batch_inputs(
+                    args.input_directories,
+                    pattern=args.pattern,
+                )
+            )
+        elif args.pattern != "*.fits":
+            raise Step05Error("--pattern requires at least one --input-dir.")
         if not combined_inputs:
             raise Step05Error(
-                "at least one --input or --input-list entry is required."
+                "at least one --input, --input-list, or --input-dir entry "
+                "is required."
             )
+        if args.workers < 1:
+            raise Step05Error("--workers must be greater than or equal to 1.")
+        if args.workers > 1 and not args.continue_on_error and not args.preflight:
+            raise Step05Error(
+                "--workers greater than 1 requires --continue-on-error."
+            )
+
+        if args.preflight:
+            if any((args.manifest_json, args.manifest_csv, args.provenance_json)):
+                raise Step05Error(
+                    "manifest and provenance outputs are not written in preflight mode."
+                )
+            preflight = validate_rts_correction_batch(
+                args.metadata,
+                combined_inputs,
+                args.output_directory,
+                output_suffix=args.output_suffix,
+                overwrite=args.overwrite,
+            )
+            exit_code = 0 if preflight.is_valid else 1
+            payload = {
+                **preflight.summary(),
+                "status": "OK" if preflight.is_valid else "INVALID",
+                "exit_code": exit_code,
+            }
+            if args.json_output:
+                print(json.dumps(payload, sort_keys=True, separators=(",", ":")))
+            elif not args.quiet:
+                print("RTS batch preflight completed")
+                print(f"Metadata       : {preflight.metadata_path}")
+                print(f"Output dir     : {preflight.output_directory}")
+                print(f"Inputs         : {len(preflight.items)}")
+                print(f"Valid          : {preflight.valid_item_count}")
+                print(f"Invalid        : {preflight.invalid_item_count}")
+                print(f"Errors         : {preflight.error_count}")
+                print(f"Ready          : {preflight.is_valid}")
+                for item in preflight.items:
+                    for issue in item.issues:
+                        print(f"[{issue.code}] {item.input_path}: {issue.message}")
+                for issue in preflight.artifact_issues:
+                    print(f"[{issue.code}] {issue.message}")
+            return exit_code
 
         result = run_rts_correction_batch(
             args.metadata,
@@ -2001,6 +2392,7 @@ def run_rts_correction_batch_cli(
             state_tolerance_fraction=args.state_tolerance_fraction,
             overwrite=args.overwrite,
             continue_on_error=args.continue_on_error,
+            workers=args.workers,
         )
     except Step05Error as exc:
         if args.json_output:
@@ -2057,6 +2449,7 @@ def run_rts_correction_batch_cli(
     exit_code = 0 if result.all_succeeded else 1
     summary = {
         **result.summary(),
+        "workers": args.workers,
         "status": "OK" if result.all_succeeded else "PARTIAL",
         "exit_code": exit_code,
     }
@@ -2077,6 +2470,7 @@ def run_rts_correction_batch_cli(
         print(f"Succeeded      : {result.succeeded_count}")
         print(f"Failed         : {result.failed_count}")
         print(f"All succeeded  : {result.all_succeeded}")
+        print(f"Workers        : {args.workers}")
         for item in result.items:
             status = "OK" if item.succeeded else "ERROR"
             print(f"[{status}] {item.input_path} -> {item.output_path}")

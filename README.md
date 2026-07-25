@@ -57,3 +57,12 @@ RTS Classification
               │
               ▼
       Threshold Optimizer
+
+## Step05 CLI example
+python step05_apply_rts_correction.py \
+    --metadata dictionary.metadata.json \
+    --input-dir science \
+    --pattern "*.fits" \
+    --output-directory corrected \
+    --workers 4 \
+    --continue-on-error

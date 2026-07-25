@@ -17,7 +17,7 @@ import os
 import sys
 import tempfile
 
-__version__ = "4.36.0"
+__version__ = "4.37.0"
 
 from dataclasses import dataclass
 from enum import Enum
@@ -78,6 +78,7 @@ __all__ = [
     "load_rts_dictionary_csv",
     "load_rts_dictionary_artifacts",
     "validate_rts_dictionary_artifacts",
+    "write_rts_dictionary_artifact_validation_json",
     "validate_rts_dictionary_input_files",
     "fingerprint_rts_dictionary_input_files",
     "write_rts_input_file_fingerprints_json",
@@ -708,6 +709,17 @@ class RTSDictionaryArtifactValidation:
             "input_file_count": self.input_file_count,
             "fingerprint_algorithm": self.fingerprints.algorithm,
             "comparison_matches": self.comparison.matches,
+        }
+
+
+    def to_json_summary(self) -> dict[str, object]:
+        """Return the stable external JSON validation summary."""
+        return {
+            "status": "VALID",
+            "ok": True,
+            "exit_code": 0,
+            "message": "RTS dictionary artifact validation passed.",
+            **self.summary(),
         }
 
 
@@ -4507,6 +4519,33 @@ def _validate_min_frames(value: int) -> int:
 
 
 
+
+
+def write_rts_dictionary_artifact_validation_json(
+    validation: RTSDictionaryArtifactValidation,
+    output_path,
+) -> Path:
+    """Write one deterministic external artifact-validation JSON report."""
+    if not isinstance(validation, RTSDictionaryArtifactValidation):
+        raise Step04Error(
+            "validation must be an RTSDictionaryArtifactValidation."
+        )
+
+    destination = _normalized_artifact_path(output_path)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+
+    with destination.open("w", encoding="utf-8", newline="\n") as stream:
+        json.dump(
+            validation.to_json_summary(),
+            stream,
+            ensure_ascii=False,
+            indent=2,
+        )
+        stream.write("\n")
+
+    return destination
+
+
 def write_rts_input_audit_json(
     audit: RTSInputAuditResult,
     output_path,
@@ -4549,6 +4588,14 @@ def _build_rts_input_audit_argument_parser():
         "metadata_path",
         type=Path,
         help="Path to the Step 04 dictionary metadata JSON.",
+    )
+    parser.add_argument(
+        "--validate",
+        action="store_true",
+        help=(
+            "Validate the complete Step 04 artifact set instead of "
+            "auditing current input files."
+        ),
     )
     parser.add_argument(
         "--fingerprint-json",
@@ -4627,6 +4674,43 @@ def _write_rts_input_audit_cli_json(
     stream.write("\n")
 
 
+
+
+def _write_rts_dictionary_artifact_validation_cli_report(
+    validation: RTSDictionaryArtifactValidation,
+    stream,
+) -> None:
+    """Write one deterministic human-readable validation report."""
+    print("RTS dictionary artifact validation", file=stream)
+    print("Status                : VALID", file=stream)
+    print(f"Dataset               : {validation.artifacts.dataset}", file=stream)
+    print(f"Candidates            : {validation.candidate_count}", file=stream)
+    print(f"Input files           : {validation.input_file_count}", file=stream)
+    print(
+        f"Fingerprint algorithm : {validation.fingerprints.algorithm}",
+        file=stream,
+    )
+    print(
+        f"Comparison matches    : {validation.comparison.matches}",
+        file=stream,
+    )
+    print("Validation PASSED", file=stream)
+
+
+def _write_rts_dictionary_artifact_validation_cli_json(
+    validation: RTSDictionaryArtifactValidation,
+    stream,
+) -> None:
+    """Write one deterministic machine-readable validation object."""
+    json.dump(
+        validation.to_json_summary(),
+        stream,
+        ensure_ascii=False,
+        indent=2,
+    )
+    stream.write("\n")
+
+
 def run_rts_input_audit_cli(
     argv=None,
     *,
@@ -4651,6 +4735,55 @@ def run_rts_input_audit_cli(
 
     parser._print_message = print_message
     namespace = parser.parse_args(argv)
+
+    if namespace.validate:
+        try:
+            validation = validate_rts_dictionary_artifacts(
+                namespace.metadata_path,
+                fingerprint_json_path=namespace.fingerprint_json_path,
+                comparison_json_path=namespace.comparison_json_path,
+            )
+        except (Step04Error, OSError, ValueError) as exc:
+            if not namespace.quiet:
+                if namespace.json:
+                    json.dump(
+                        {
+                            "status": "INVALID",
+                            "ok": False,
+                            "exit_code": 4,
+                            "message": str(exc),
+                        },
+                        output_stream,
+                        ensure_ascii=False,
+                        indent=2,
+                    )
+                    output_stream.write("\n")
+                else:
+                    print(
+                        "RTS dictionary artifact validation",
+                        file=error_stream,
+                    )
+                    print("Status : INVALID", file=error_stream)
+                    print(f"Reason : {exc}", file=error_stream)
+            return 4
+
+        if namespace.json_output_path is not None:
+            write_rts_dictionary_artifact_validation_json(
+                validation,
+                namespace.json_output_path,
+            )
+
+        if namespace.json:
+            _write_rts_dictionary_artifact_validation_cli_json(
+                validation,
+                output_stream,
+            )
+        elif not namespace.quiet:
+            _write_rts_dictionary_artifact_validation_cli_report(
+                validation,
+                output_stream,
+            )
+        return 0
 
     try:
         audit = audit_rts_dictionary_input_files(
