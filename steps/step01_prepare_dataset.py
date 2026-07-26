@@ -120,8 +120,9 @@ def write_normalized_manifest(
     """Write a validated manifest in the canonical RTS CSV representation.
 
     The output has a fixed column order, absolute frame paths, LF line endings,
-    and deterministic row ordering by dataset and frame index.  A normalized
-    manifest is written only when the complete Step 01 result is valid.
+    and deterministic row ordering that preserves the source manifest order.
+    A normalized manifest is written only when the complete Step 01 result is
+    valid.
 
     Parameters
     ----------
@@ -148,11 +149,7 @@ def write_normalized_manifest(
     path = Path(output_path)
     ordered_frames = sorted(
         result.manifest.frames,
-        key=lambda frame: (
-            frame.dataset,
-            frame.frame_index,
-            frame.manifest_row,
-        ),
+        key=lambda frame: frame.manifest_row,
     )
 
     try:
