@@ -1,7 +1,7 @@
 """Step 05: prepare deterministic RTS correction plans.
 
-Version 5.12.0 adds deterministic multiprocessing for independent FITS inputs
-while preserving input order and parent-process manifest/provenance aggregation.
+Version 5.13.0 reorganizes module execution and removes a duplicate SHA256
+helper without changing the RTS correction algorithm or output semantics.
 """
 
 from __future__ import annotations
@@ -38,7 +38,7 @@ from steps.step04_prepare_rts_dictionary_analysis import (
     validate_rts_dictionary_artifacts,
 )
 
-__version__ = "5.12.0"
+__version__ = "5.13.0"
 
 __all__ = [
     "RTSCandidateClassification",
@@ -1188,20 +1188,6 @@ def apply_rts_correction_in_memory(
     )
 
 
-def _sha256_file(path: Path) -> str:
-    """Return the SHA256 digest of one file."""
-    digest = hashlib.sha256()
-    try:
-        with path.open("rb") as stream:
-            for chunk in iter(lambda: stream.read(1024 * 1024), b""):
-                digest.update(chunk)
-    except OSError as exc:
-        raise Step05Error(
-            f"Could not calculate SHA256 for '{path}': {exc}"
-        ) from exc
-    return digest.hexdigest()
-
-
 def _read_primary_header(path: Path) -> fits.Header:
     """Read and copy the source primary FITS header."""
     try:
@@ -1759,10 +1745,6 @@ def run_rts_correction_cli(
         print("Verified       : True")
 
     return 0
-
-
-if __name__ == "__main__":
-    raise SystemExit(run_rts_correction_cli())
 
 
 
@@ -2479,3 +2461,6 @@ def run_rts_correction_batch_cli(
 
     return exit_code
 
+
+if __name__ == "__main__":
+    raise SystemExit(run_rts_correction_cli())
