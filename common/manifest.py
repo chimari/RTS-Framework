@@ -791,12 +791,15 @@ class FrameManifest:
             row = frame.manifest_row
             dataset = frame.dataset or None
 
-            if row < 0:
+            if row < 2:
                 issues.append(
                     ManifestIssue(
                         "error",
-                        "negative_manifest_row",
-                        f"manifest_row must be non-negative, got {row}.",
+                        "invalid_manifest_row",
+                        (
+                            "manifest_row must be a physical CSV data-line number "
+                            f"greater than or equal to 2, got {row}."
+                        ),
                         row,
                         dataset,
                     )
