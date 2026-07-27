@@ -182,7 +182,10 @@ class FrameRecord:
     Parameters
     ----------
     manifest_row
-        Zero-based row number in the source manifest.
+        Physical line number in the source manifest CSV.
+
+        The header occupies line 1, therefore the first data record
+        has ``manifest_row == 2``.
     dataset
         Dataset or acquisition-sequence name.
     directory
