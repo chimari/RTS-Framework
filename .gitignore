@@ -11,6 +11,8 @@ build/
 *.fit
 *.bin
 *.csv.gz
+*~
+#*#
 outputs/
 work/
 data/
