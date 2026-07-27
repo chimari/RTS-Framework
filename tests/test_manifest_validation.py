@@ -167,3 +167,32 @@ def test_errors_and_warnings_are_separated() -> None:
     assert {i.issue_type for i in validation.warnings} == {
         "temperature_fraction_out_of_range",
     }
+
+
+def test_manifest_row_before_first_data_line_is_invalid() -> None:
+    manifest = FrameManifest(
+        [
+            make_frame(manifest_row=1),
+        ]
+    )
+
+    validation = manifest.validate_structure()
+
+    assert not validation.valid
+    assert "invalid_manifest_row" in {
+        issue.issue_type for issue in validation.errors
+    }
+
+    
+def test_first_data_line_manifest_row_is_valid() -> None:
+    manifest = FrameManifest(
+        [
+            make_frame(manifest_row=2),
+        ]
+    )
+
+    validation = manifest.validate_structure()
+
+    assert "invalid_manifest_row" not in {
+        issue.issue_type for issue in validation.issues
+    }
