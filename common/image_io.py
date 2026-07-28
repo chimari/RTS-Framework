@@ -15,11 +15,14 @@ Public API
 - detect_format
 - read_image
 - get_image_shape
+- get_image_metadata
 - validate_image
 """
 from __future__ import annotations
+from dataclasses import dataclass
+import sys
 
-__version__ = "0.6.1"
+__version__ = "0.7.0-dev"
 
 from enum import Enum
 from pathlib import Path
@@ -33,6 +36,14 @@ from .manifest import FrameRecord
 
 ImageSource: TypeAlias = str | Path | FrameRecord
 
+@dataclass(frozen=True, slots=True)
+class ImageMetadata:
+    """Normalized image metadata returned by image_io."""
+
+    width: int
+    height: int
+    pixel_dtype: str
+    byte_order: str
 
 class ImageIOError(Exception):
     """Base exception for image-I/O related errors."""
@@ -53,6 +64,22 @@ _FITS_SUFFIXES = frozenset({".fit", ".fits", ".fts"})
 _RAW_SUFFIXES = frozenset({".bin", ".raw", ".dat"})
 
 
+import sys
+
+def _normalize_byte_order(dtype: np.dtype) -> str:
+    symbol = dtype.byteorder
+
+    if symbol == "=":
+        symbol = "<" if sys.byteorder == "little" else ">"
+
+    if symbol == "<":
+        return "little"
+
+    if symbol == ">":
+        return "big"
+
+    return "not_applicable"
+
 def _normalize_source(source: ImageSource) -> Path:
     """
     Convert an image source into a :class:`pathlib.Path`.
@@ -61,7 +88,8 @@ def _normalize_source(source: ImageSource) -> Path:
     ----------
     source
         A path string, ``Path``, or ``FrameRecord``.
-
+        For a ``FrameRecord``, ``resolved_path`` is used for filesystem access.
+    
     Returns
     -------
     pathlib.Path
@@ -73,7 +101,12 @@ def _normalize_source(source: ImageSource) -> Path:
         If ``source`` is not a supported object.
     """
     if isinstance(source, FrameRecord):
-        return source.filepath
+        if source.resolved_path is None:
+            raise ImageIOError(
+                "FrameRecord resolved_path is not available: "
+                f"filepath={source.filepath}"
+            )
+        return source.resolved_path
 
     if isinstance(source, Path):
         return source
@@ -168,11 +201,26 @@ def read_image(source: ImageSource) -> np.ndarray:
 
 def get_image_shape(source: ImageSource) -> tuple[int, int]:
     """
-    Return image shape as ``(height, width)`` without loading FITS pixels.
+    Return image shape as ``(height, width)``.
 
-    Singleton axes are removed before the dimensionality check, matching the
-    behavior of :func:`read_image`. For example, ``(1, height, width)`` becomes
-    ``(height, width)``.
+    This is a lightweight wrapper around :func:`get_image_metadata`.
+    """
+    metadata = get_image_metadata(source)
+    return (metadata.height, metadata.width)
+
+def get_image_metadata(source: ImageSource) -> ImageMetadata:
+    """
+    Return normalized image metadata independent of image format.
+
+    Parameters
+    ----------
+    source
+        Image path or FrameRecord.
+
+    Returns
+    -------
+    ImageMetadata
+        Image geometry, dtype and byte order.
     """
     path = _normalize_source(source)
 
@@ -182,19 +230,9 @@ def get_image_shape(source: ImageSource) -> tuple[int, int]:
     image_format = detect_format(source)
 
     if image_format is ImageFormat.FITS:
-        shape = _get_fits_shape(path)
-    else:
-        shape, _ = _get_raw_layout(source)
+        return _get_fits_metadata(path)
 
-    squeezed_shape = tuple(dimension for dimension in shape if dimension != 1)
-
-    if len(squeezed_shape) != 2:
-        raise ImageIOError(
-            "Image must be two-dimensional after removing singleton axes: "
-            f"path={path}, shape={shape}"
-        )
-
-    return squeezed_shape
+    return _get_raw_metadata(source)
 
 def validate_image(source: ImageSource) -> None:
     """
@@ -217,6 +255,7 @@ def validate_image(source: ImageSource) -> None:
         If the file is missing, unreadable, unsupported, not two-dimensional,
         or inconsistent with metadata stored in a ``FrameRecord``.
     """
+    metadata = get_image_metadata(source)
     image = read_image(source)
 
     if not isinstance(source, FrameRecord):
@@ -231,8 +270,17 @@ def validate_image(source: ImageSource) -> None:
                 f"image_height={source.image_height}"
             )
 
-        expected_shape = (source.image_height, source.image_width)
-        if image.shape != expected_shape:
+        expected_shape = (
+            source.image_height,
+            source.image_width,
+        )
+
+        actual_shape = (
+            metadata.height,
+            metadata.width,
+        )
+
+        if actual_shape != expected_shape:
             raise ImageIOError(
                 "Image shape does not match FrameRecord metadata: "
                 f"path={source.filepath}, "
@@ -248,7 +296,9 @@ def validate_image(source: ImageSource) -> None:
                 f"path={source.filepath}, pixel_dtype={source.pixel_dtype!r}"
             ) from exc
 
-        if image.dtype != expected_dtype:
+        actual_dtype = np.dtype(metadata.pixel_dtype)
+
+        if actual_dtype != expected_dtype:          
             raise ImageIOError(
                 "Image dtype does not match FrameRecord metadata: "
                 f"path={source.filepath}, "
@@ -320,6 +370,22 @@ def _get_raw_layout(
     return shape, dtype
 
 
+def _get_raw_metadata(source: ImageSource) -> ImageMetadata:
+    """
+    Return normalized metadata for a headerless RAW image.
+    """
+
+    shape, dtype = _get_raw_layout(source)
+
+    height, width = shape
+
+    return ImageMetadata(
+        width=width,
+        height=height,
+        pixel_dtype=dtype.name,
+        byte_order=_normalize_byte_order(dtype),
+    )
+
 def _read_raw(source: ImageSource, path: Path) -> np.ndarray:
     """Read a headerless RAW image using metadata stored in a FrameRecord."""
     shape, dtype = _get_raw_layout(source)
@@ -357,25 +423,18 @@ def _read_raw(source: ImageSource, path: Path) -> np.ndarray:
     return image.reshape(shape)
 
 
-def _get_fits_shape(path: Path) -> tuple[int, ...]:
-    """Return the first non-empty FITS image shape without loading pixel data."""
-    try:
-        with fits.open(
-            path,
-            mode="readonly",
-            memmap=True,
-            do_not_scale_image_data=True,
-        ) as hdul:
-            for hdu in hdul:
-                shape = tuple(getattr(hdu, "shape", ()) or ())
-                if shape:
-                    return shape
-    except (OSError, ValueError, TypeError) as exc:
-        raise ImageIOError(
-            f"Unable to inspect FITS image shape: {path}: {exc}"
-        ) from exc
+def _get_fits_metadata(path: Path) -> ImageMetadata:
+    """Return normalized metadata for a FITS image."""
+    image = read_image(path)
+    height, width = image.shape
 
-    raise ImageIOError(f"FITS file contains no image data: {path}")
+    return ImageMetadata(
+        width=width,
+        height=height,
+        pixel_dtype=image.dtype.name,
+        byte_order=_normalize_byte_order(image.dtype),
+    )
+
 
 def _read_fits(path: Path) -> np.ndarray:
     """Read image data from the first FITS HDU containing an array."""

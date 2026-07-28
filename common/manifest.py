@@ -234,7 +234,12 @@ class FrameRecord:
     exposure_s: float
 
     filename: str
+
+    # Path as written in the Input Manifest.
     filepath: Path
+
+    # Actual filesystem path used internally.
+    resolved_path: Path | None = None
 
     image_width: int | None = None
     image_height: int | None = None
@@ -242,8 +247,18 @@ class FrameRecord:
     byte_order: str | None = None
 
     def __post_init__(self) -> None:
-        """Normalize ``filepath`` while retaining dataclass immutability."""
-        object.__setattr__(self, "filepath", Path(self.filepath))
+        """Normalize image paths while retaining dataclass immutability."""
+
+        filepath = Path(self.filepath)
+
+        resolved_path = (
+            filepath
+            if self.resolved_path is None
+            else Path(self.resolved_path)
+        )
+
+        object.__setattr__(self, "filepath", filepath)
+        object.__setattr__(self, "resolved_path", resolved_path)
 
 
 @dataclass(slots=True, frozen=True)
@@ -571,9 +586,12 @@ class FrameManifest:
             raise ManifestError(
                 f"CSV line {csv_line}: internal filepath conversion failed."
             )
-        values["filepath"] = FrameManifest._resolve_filepath(filepath, frame_root)
+        values["resolved_path"] = FrameManifest._resolve_filepath(
+            filepath,
+            frame_root,
+        )
 
-        return FrameRecord(**values)  # type: ignore[arg-type]
+        return FrameRecord(**values)
 
     @staticmethod
     def _resolve_filepath(filepath: Path, frame_root: Path | None) -> Path:

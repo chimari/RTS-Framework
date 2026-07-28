@@ -162,11 +162,10 @@ def write_normalized_manifest(
             )
             writer.writeheader()
             for frame in ordered_frames:
-                absolute_path = frame.filepath.resolve()
                 writer.writerow(
                     {
                         "dataset": frame.dataset,
-                        "directory": str(absolute_path.parent),
+                        "directory": frame.directory,
                         "environment": frame.environment,
                         "frame_index": frame.frame_index,
                         "n_frames": frame.n_frames,
@@ -175,8 +174,8 @@ def write_normalized_manifest(
                         "temperature_end_C": frame.temperature_end_C,
                         "temperature_fraction": frame.temperature_fraction,
                         "exposure_s": frame.exposure_s,
-                        "filename": absolute_path.name,
-                        "filepath": str(absolute_path),
+                        "filename": frame.filename,
+                        "filepath": str(frame.filepath),
                         "image_width": frame.image_width,
                         "image_height": frame.image_height,
                         "pixel_dtype": frame.pixel_dtype,
