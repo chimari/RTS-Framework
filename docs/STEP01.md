@@ -1,4 +1,4 @@
-o# STEP01 – Dataset Preparation
+# STEP01 – Dataset Preparation
 
 ## Purpose
 
