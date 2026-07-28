@@ -19,7 +19,7 @@ Public API
 """
 from __future__ import annotations
 
-__version__ = "0.6.0"
+__version__ = "0.6.1"
 
 from enum import Enum
 from pathlib import Path

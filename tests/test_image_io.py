@@ -1,12 +1,23 @@
 #!/usr/bin/env python3
 """
-Smoke test for common.image_io FITS reading.
+Image input/output helpers for the RTS Framework.
 
-Usage
------
-python tests/test_image_io.py IMAGE_PATH --expect fits
+This implementation provides source normalization, image-format detection,
+two-dimensional FITS and headerless RAW image reading, image-shape inspection,
+and image validation.
+
+Headerless RAW input requires image geometry and pixel-layout metadata from a
+FrameRecord.
+
+Public API
+----------
+- ImageFormat
+- ImageSource
+- detect_format
+- read_image
+- get_image_shape
+- validate_image
 """
-
 from __future__ import annotations
 
 import argparse
@@ -196,13 +207,13 @@ def main() -> int:
     print("   Result     : PASS")
     print()
 
-    label = (
+    primary_label = (
         "Path"
         if args.expect == "fits"
         else "FrameRecord"
     )
         
-    print(f"[3/13] Image reading from {label}")
+    print(f"[3/13] Image reading from {primary_label}")
     frame = None
 
     if args.expect == "raw":
@@ -255,23 +266,20 @@ def main() -> int:
     frame_image = image_io.read_image(frame)
 
     if not np.array_equal(frame_image, image):
-        print("   Result     : FAIL (FrameRecord result differs from Path result)")
+        print(
+            "   Result     : FAIL "
+            "(FrameRecord result differs from first read)"
+        )
         return 1
 
     print(f"   Source     : {type(frame).__name__}")
     print(f"   Shape      : {frame_image.shape}")
     print(f"   dtype      : {frame_image.dtype}")
-    print("   Match Path : YES")
+    print("   Match first read : YES")
     print("   Result     : PASS")
     print()
 
-    label = (
-        "Path"
-        if args.expect == "fits"
-        else "FrameRecord"
-    )
-
-    print(f"[5/13] Image shape from {label}")
+    print(f"[5/13] Image shape from {primary_label}")
     
     if args.expect == "fits":
         primary_shape = image_io.get_image_shape(source)
@@ -292,14 +300,14 @@ def main() -> int:
     frame_shape = image_io.get_image_shape(frame)
     print(f"   Source     : {type(frame).__name__}")
     print(f"   Shape      : {frame_shape}")
-    print(f"   Match primary source : {frame_shape == primary_shape}")
+    print(f"   Match first shape : {frame_shape == primary_shape}")
     if frame_shape != primary_shape:
         print("   Result     : FAIL")
         return 1
     print("   Result     : PASS")
     print()
 
-    print(f"[7/13] Image validation from {label}")
+    print(f"[7/13] Image validation from {primary_label}")
     if args.expect == "fits":
         image_io.validate_image(source)
     else:
@@ -316,7 +324,7 @@ def main() -> int:
     print("   Result     : PASS")
     print()
 
-    def expect_image_io_error(label: str, callback) -> bool:
+    def expect_image_io_error(primary_label: str, callback) -> bool:
         try:
             callback()
         except image_io.ImageIOError as exc:
@@ -444,7 +452,7 @@ def main() -> int:
         return 1
 
     print("=" * 72)
-    print("FINISHED: image_io shape and validation tests passed")
+    print("FINISHED: image_io FITS/RAW smoke tests passed")
     print("=" * 72)
     return 0
 
