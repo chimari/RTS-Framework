@@ -1,3 +1,20 @@
+# Changelog
+
+All notable changes to RTS-Framework are documented here.
+
+---
+
+## Documentation Milestone 1.0
+
+### Added
+
+- Architecture document
+- Architecture Decision Records
+- Validation architecture
+- Validation documentation for Step01–Step06
+- Development policy
+- Documentation-first workflow
+
 ## [Step06 v6.4.0]
 
 ### Added
