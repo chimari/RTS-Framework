@@ -17,8 +17,17 @@ from pathlib import Path
 import sys
 from typing import Callable, Literal, Sequence
 
-from common.image_io import ImageIOError, get_image_shape, validate_image
-from common.manifest import FrameManifest, FrameRecord, ManifestError, ManifestValidation
+from common.image_io import (
+    ImageIOError,
+    get_image_metadata,
+    validate_image,
+)
+from common.manifest import (
+    FrameManifest,
+    FrameRecord,
+    ManifestError,
+    ManifestValidation,
+)
 
 
 ValidationMode = Literal["shape", "full"]
@@ -119,8 +128,9 @@ def write_normalized_manifest(
 ) -> Path:
     """Write a validated manifest in the canonical RTS CSV representation.
 
-    The output has a fixed column order, absolute frame paths, LF line endings,
-    and deterministic row ordering that preserves the source manifest order.
+    The output has a fixed column order, preserves the frame paths stored in
+    the source manifest, uses LF line endings, and preserves the source
+    manifest row order. Image metadata is extracted from each referenced image.
     A normalized manifest is written only when the complete Step 01 result is
     valid.
 
@@ -139,7 +149,8 @@ def write_normalized_manifest(
     Raises
     ------
     Step01Error
-        If validation failed or the destination cannot be written.
+        If validation failed, image metadata cannot be extracted, or the
+        destination cannot be written.
     """
     if not result.valid:
         raise Step01Error(
@@ -154,6 +165,7 @@ def write_normalized_manifest(
 
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
+
         with path.open("w", encoding="utf-8", newline="") as stream:
             writer = csv.DictWriter(
                 stream,
@@ -161,7 +173,10 @@ def write_normalized_manifest(
                 lineterminator="\n",
             )
             writer.writeheader()
+
             for frame in ordered_frames:
+                metadata = get_image_metadata(frame)
+
                 writer.writerow(
                     {
                         "dataset": frame.dataset,
@@ -176,18 +191,26 @@ def write_normalized_manifest(
                         "exposure_s": frame.exposure_s,
                         "filename": frame.filename,
                         "filepath": str(frame.filepath),
-                        "image_width": frame.image_width,
-                        "image_height": frame.image_height,
-                        "pixel_dtype": frame.pixel_dtype,
-                        "byte_order": frame.byte_order,
+                        "image_width": metadata.width,
+                        "image_height": metadata.height,
+                        "pixel_dtype": metadata.pixel_dtype,
+                        "byte_order": metadata.byte_order,
                     }
                 )
+
+    except (ImageIOError, NotImplementedError) as exc:
+        raise Step01Error(
+            f"Unable to extract image metadata while writing "
+            f"normalized manifest: {exc}"
+        ) from exc
+
     except (OSError, csv.Error, TypeError, ValueError) as exc:
         raise Step01Error(
             f"Unable to write normalized manifest: {path}: {exc}"
         ) from exc
 
     return path
+
 
 def write_report(
     result: Step01Result,
@@ -301,8 +324,8 @@ def prepare_dataset(
     frame_root
         Optional root used to resolve relative ``filepath`` values.
     validation_mode
-        ``"shape"`` inspects FITS dimensions without loading pixel arrays.
-        ``"full"`` reads each image and also validates dtype metadata.
+        ``"shape"`` validates image metadata.
+       ``"full"`` additionally reads the full image.
     progress
         Optional callback receiving ``(current, total, frame)`` before each
         image is checked.
@@ -324,7 +347,10 @@ def prepare_dataset(
         )
 
     try:
-        manifest = FrameManifest.from_csv(manifest_path, frame_root=frame_root)
+        manifest = FrameManifest.from_csv(
+            manifest_path,
+            frame_root=frame_root,
+        )
     except ManifestError as exc:
         raise Step01Error(f"Unable to load manifest: {exc}") from exc
 
@@ -337,10 +363,12 @@ def prepare_dataset(
             progress(current, total, frame)
 
         try:
-            if validation_mode == "full":
-                validate_image(frame)
+            if validation_mode == "shape":
+                _validate_image_metadata(frame)
             else:
-                _validate_shape(frame)
+                _validate_image_metadata(frame)
+                validate_image(frame)
+                
         except (ImageIOError, NotImplementedError) as exc:
             image_issues.append(
                 ImageValidationIssue(
@@ -359,28 +387,47 @@ def prepare_dataset(
     )
 
 
-def _validate_shape(frame: FrameRecord) -> None:
-    """Validate readability, dimensionality, and optional geometry metadata."""
-    actual_shape = get_image_shape(frame)
+def _validate_image_metadata(frame: FrameRecord) -> None:
+    """Validate optional image metadata recorded in the FrameRecord."""
+    metadata = get_image_metadata(frame)
 
-    if frame.image_width is None and frame.image_height is None:
-        return
+    if frame.image_width is not None:
+        if metadata.width != frame.image_width:
+            raise ImageIOError(
+                "Image width does not match manifest metadata: "
+                f"path={frame.filepath}, "
+                f"expected={frame.image_width}, "
+                f"actual={metadata.width}"
+            )
 
-    if frame.image_width is None or frame.image_height is None:
-        raise ImageIOError(
-            "FrameRecord image geometry is incomplete: "
-            f"path={frame.filepath}, image_width={frame.image_width}, "
-            f"image_height={frame.image_height}"
-        )
+    if frame.image_height is not None:
+        if metadata.height != frame.image_height:
+            raise ImageIOError(
+                "Image height does not match manifest metadata: "
+                f"path={frame.filepath}, "
+                f"expected={frame.image_height}, "
+                f"actual={metadata.height}"
+            )
 
-    expected_shape = (frame.image_height, frame.image_width)
-    if actual_shape != expected_shape:
-        raise ImageIOError(
-            "Image shape does not match FrameRecord metadata: "
-            f"path={frame.filepath}, expected={expected_shape}, "
-            f"actual={actual_shape}"
-        )
+    if frame.pixel_dtype is not None:
+        if metadata.pixel_dtype != frame.pixel_dtype:
+            raise ImageIOError(
+                "Pixel dtype does not match manifest metadata: "
+                f"path={frame.filepath}, "
+                f"expected={frame.pixel_dtype!r}, "
+                f"actual={metadata.pixel_dtype!r}"
+            )
 
+    if frame.byte_order is not None:
+        if metadata.byte_order != frame.byte_order:
+            raise ImageIOError(
+                "Byte order does not match manifest metadata: "
+                f"path={frame.filepath}, "
+                f"expected={frame.byte_order!r}, "
+                f"actual={metadata.byte_order!r}"
+            )
+
+        
 def build_argument_parser() -> argparse.ArgumentParser:
     """Build the Step 01 command-line argument parser."""
     parser = argparse.ArgumentParser(
@@ -405,8 +452,8 @@ def build_argument_parser() -> argparse.ArgumentParser:
         choices=("shape", "full"),
         default="shape",
         help=(
-            "Image validation level: shape reads metadata only; "
-            "full also reads pixel arrays and checks dtype."
+            "Image validation level: shape validates image metadata only; "
+            "full validates imagee metadata and read pixel arrays."
         ),
     )
     parser.add_argument(

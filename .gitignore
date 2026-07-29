@@ -19,3 +19,4 @@ data/
 learning.db
 *.sqlite*
 !tests/fixtures/**
+*.bak

@@ -12,12 +12,8 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
+from common.image_io import get_image_metadata
 from steps import step01_prepare_dataset as step01
-
-
-WIDTH = 9576
-HEIGHT = 6388
-DTYPE = "uint16"
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -30,6 +26,27 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Use full image validation instead of shape-only validation.",
     )
+
+    parser.add_argument(
+        "--width",
+        type=int,
+        help="RAW image width in pixels.",
+    )
+    parser.add_argument(
+        "--height",
+        type=int,
+        help="RAW image height in pixels.",
+    )
+    parser.add_argument(
+        "--dtype",
+        help="RAW pixel dtype, for example uint16.",
+    )
+    parser.add_argument(
+        "--byte-order",
+        choices=("little", "big", "native", "not-applicable"),
+        help="RAW byte order.",
+    )
+
     return parser
 
 
@@ -41,11 +58,32 @@ def make_row(
     frame_index: int,
     n_frames: int,
     filepath: Path | None = None,
-    image_width: int = WIDTH,
-    image_height: int = HEIGHT,
-    pixel_dtype: str = DTYPE,
+    raw_layout: dict[str, object] | None = None,
 ) -> dict[str, object]:
     selected_path = image if filepath is None else filepath
+
+    suffix = image.suffix.lower()
+
+    if suffix in {".fit", ".fits", ".fts"}:
+        metadata = get_image_metadata(image)
+
+        image_width = metadata.width
+        image_height = metadata.height
+        pixel_dtype = metadata.pixel_dtype
+        byte_order = metadata.byte_order
+
+    else:
+        if raw_layout is None:
+            raise RuntimeError(
+                "RAW test requires --width, --height, "
+                "--dtype, and --byte-order."
+            )
+
+        image_width = raw_layout["image_width"]
+        image_height = raw_layout["image_height"]
+        pixel_dtype = raw_layout["pixel_dtype"]
+        byte_order = raw_layout["byte_order"]
+
     return {
         "dataset": dataset,
         "directory": str(selected_path.parent),
@@ -64,7 +102,7 @@ def make_row(
         "image_width": image_width,
         "image_height": image_height,
         "pixel_dtype": pixel_dtype,
-        "byte_order": "not-applicable",
+        "byte_order": byte_order,
     }
 
 
@@ -76,7 +114,10 @@ def write_manifest(path: Path, rows: list[dict[str, object]]) -> None:
         writer.writerows(rows)
 
 
-def valid_rows(images: list[Path]) -> list[dict[str, object]]:
+def valid_rows(
+    images: list[Path],
+    raw_layout: dict[str, object] | None = None,
+) -> list[dict[str, object]]:
     return [
         make_row(
             images[0],
@@ -84,6 +125,7 @@ def valid_rows(images: list[Path]) -> list[dict[str, object]]:
             environment="cold",
             frame_index=0,
             n_frames=2,
+            raw_layout=raw_layout,
         ),
         make_row(
             images[1],
@@ -91,6 +133,7 @@ def valid_rows(images: list[Path]) -> list[dict[str, object]]:
             environment="cold",
             frame_index=1,
             n_frames=2,
+            raw_layout=raw_layout,
         ),
         make_row(
             images[2],
@@ -98,22 +141,31 @@ def valid_rows(images: list[Path]) -> list[dict[str, object]]:
             environment="room",
             frame_index=0,
             n_frames=1,
+            raw_layout=raw_layout,
         ),
     ]
 
+def invalid_rows(
+    images: list[Path],
+    raw_layout: dict[str, object] | None = None,
+) -> list[dict[str, object]]:
+    missing = images[4].with_name(
+        f"missing_frame{images[4].suffix}"
+    )
 
-def invalid_rows(images: list[Path]) -> list[dict[str, object]]:
-    missing = images[4].with_name("missing_frame.fit")
+    bad_shape = make_row(
+        images[3],
+        dataset="broken-shape",
+        environment="test",
+        frame_index=0,
+        n_frames=1,
+        raw_layout=raw_layout,
+    )
 
-    return valid_rows(images) + [
-        make_row(
-            images[3],
-            dataset="broken-shape",
-            environment="test",
-            frame_index=0,
-            n_frames=1,
-            image_width=WIDTH + 1,
-        ),
+    bad_shape["image_width"] = int(bad_shape["image_width"]) + 1
+
+    return valid_rows(images, raw_layout) + [
+        bad_shape,
         make_row(
             images[4],
             dataset="broken-missing",
@@ -121,11 +173,16 @@ def invalid_rows(images: list[Path]) -> list[dict[str, object]]:
             frame_index=0,
             n_frames=1,
             filepath=missing,
+            raw_layout=raw_layout,
         ),
     ]
 
-
-def run_test(image: Path, *, full: bool) -> int:
+def run_test(
+    image: Path,
+    *,
+    full: bool,
+    raw_layout: dict[str, object] | None = None,
+) -> int:
     if not image.is_file():
         print(f"FAIL: image does not exist: {image}")
         return 1
@@ -152,7 +209,10 @@ def run_test(image: Path, *, full: bool) -> int:
         
         print("[1/2] Valid multi-dataset manifest")
         valid_manifest = temp_root / "valid_manifest.csv"
-        write_manifest(valid_manifest, valid_rows(test_images))
+        write_manifest(
+            valid_manifest,
+            valid_rows(test_images, raw_layout),
+        )
 
         valid_progress: list[tuple[int, int, str]] = []
 
@@ -205,7 +265,10 @@ def run_test(image: Path, *, full: bool) -> int:
 
         print("[2/2] Invalid manifest with multiple image errors")
         invalid_manifest = temp_root / "invalid_manifest.csv"
-        write_manifest(invalid_manifest, invalid_rows(test_images))
+        write_manifest(
+            invalid_manifest,
+            invalid_rows(test_images, raw_layout),
+        )
 
         invalid_progress: list[tuple[int, int, str]] = []
 
@@ -252,7 +315,14 @@ def run_test(image: Path, *, full: bool) -> int:
 
         details = [issue.detail for issue in invalid_result.image_issues]
         has_shape_error = any(
-            "Image shape does not match" in detail for detail in details
+            (
+                "does not match manifest metadata" in detail
+                or (
+                    "RAW file size" in detail
+                    and "does not match" in detail
+                )
+            )
+            for detail in details
         )
         has_missing_error = any(
             "Image file does not exist" in detail for detail in details
@@ -281,8 +351,49 @@ def run_test(image: Path, *, full: bool) -> int:
 
 def main() -> int:
     args = build_parser().parse_args()
-    return run_test(args.image, full=args.full)
 
+    fits_suffixes = {".fit", ".fits", ".fts"}
+    is_fits = args.image.suffix.lower() in fits_suffixes
+
+    raw_layout: dict[str, object] | None = None
+
+    if not is_fits:
+        raw_arguments = {
+            "--width": args.width,
+            "--height": args.height,
+            "--dtype": args.dtype,
+            "--byte-order": args.byte_order,
+        }
+
+        missing_arguments = [
+            name
+            for name, value in raw_arguments.items()
+            if value is None
+        ]
+
+        if missing_arguments:
+            print(
+                "FAIL: Headerless RAW input requires: "
+                + ", ".join(missing_arguments)
+            )
+            return 2
+
+        if args.width <= 0 or args.height <= 0:
+            print("FAIL: --width and --height must be positive integers.")
+            return 2
+
+        raw_layout = {
+            "image_width": args.width,
+            "image_height": args.height,
+            "pixel_dtype": args.dtype,
+            "byte_order": args.byte_order,
+        }
+
+    return run_test(
+        args.image,
+        full=args.full,
+        raw_layout=raw_layout,
+    )
 
 if __name__ == "__main__":
     raise SystemExit(main())

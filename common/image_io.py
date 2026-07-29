@@ -22,7 +22,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 import sys
 
-__version__ = "0.7.0-dev"
+__version__ = "0.7.1-dev"
 
 from enum import Enum
 from pathlib import Path
@@ -236,74 +236,14 @@ def get_image_metadata(source: ImageSource) -> ImageMetadata:
 
 def validate_image(source: ImageSource) -> None:
     """
-    Validate that an image can be read as a two-dimensional array.
+    Validate that an image is readable.
 
-    When ``source`` is a :class:`FrameRecord`, optional image metadata are also
-    checked against the actual image:
-
-    - ``image_width`` and ``image_height``
-    - ``pixel_dtype``
-
-    Parameters
-    ----------
-    source
-        A path string, ``Path``, or ``FrameRecord``.
-
-    Raises
-    ------
-    ImageIOError
-        If the file is missing, unreadable, unsupported, not two-dimensional,
-        or inconsistent with metadata stored in a ``FrameRecord``.
+    Raises ImageIOError if the image cannot be opened or is not a
+    supported two-dimensional image.
     """
-    metadata = get_image_metadata(source)
-    image = read_image(source)
 
-    if not isinstance(source, FrameRecord):
-        return
-
-    if source.image_width is not None or source.image_height is not None:
-        if source.image_width is None or source.image_height is None:
-            raise ImageIOError(
-                "FrameRecord image geometry is incomplete: "
-                f"path={source.filepath}, "
-                f"image_width={source.image_width}, "
-                f"image_height={source.image_height}"
-            )
-
-        expected_shape = (
-            source.image_height,
-            source.image_width,
-        )
-
-        actual_shape = (
-            metadata.height,
-            metadata.width,
-        )
-
-        if actual_shape != expected_shape:
-            raise ImageIOError(
-                "Image shape does not match FrameRecord metadata: "
-                f"path={source.filepath}, "
-                f"expected={expected_shape}, actual={image.shape}"
-            )
-
-    if source.pixel_dtype is not None:
-        try:
-            expected_dtype = np.dtype(source.pixel_dtype)
-        except TypeError as exc:
-            raise ImageIOError(
-                "FrameRecord pixel_dtype is not NumPy-compatible: "
-                f"path={source.filepath}, pixel_dtype={source.pixel_dtype!r}"
-            ) from exc
-
-        actual_dtype = np.dtype(metadata.pixel_dtype)
-
-        if actual_dtype != expected_dtype:          
-            raise ImageIOError(
-                "Image dtype does not match FrameRecord metadata: "
-                f"path={source.filepath}, "
-                f"expected={expected_dtype}, actual={image.dtype}"
-            )
+    get_image_metadata(source)
+    read_image(source)
 
 
 def _get_raw_layout(
@@ -370,12 +310,63 @@ def _get_raw_layout(
     return shape, dtype
 
 
+def _validate_raw_file_size(
+    path: Path,
+    shape: tuple[int, int],
+    dtype: np.dtype,
+) -> None:
+    """
+    Validate that a headerless RAW file size matches its declared layout.
+
+    Parameters
+    ----------
+    path
+        RAW image file path.
+    shape
+        Expected NumPy image shape as ``(height, width)``.
+    dtype
+        Expected NumPy pixel dtype, including byte order.
+
+    Raises
+    ------
+    ImageIOError
+        If the file size cannot be inspected or does not match the
+        expected number of bytes.
+    """
+    expected_pixels = shape[0] * shape[1]
+    expected_bytes = expected_pixels * dtype.itemsize
+
+    try:
+        actual_bytes = path.stat().st_size
+    except OSError as exc:
+        raise ImageIOError(
+            f"Unable to inspect RAW image file size: {path}: {exc}"
+        ) from exc
+
+    if actual_bytes != expected_bytes:
+        height, width = shape
+
+        raise ImageIOError(
+            "RAW file size does not match the declared image layout.\n"
+            f"path            : {path}\n"
+            f"expected layout : {width} x {height} {dtype}\n"
+            f"expected bytes  : {expected_bytes}\n"
+            f"actual bytes    : {actual_bytes}\n"
+            "Check image_width, image_height, and pixel_dtype "
+            "in the FrameRecord."
+        )
+
+    
 def _get_raw_metadata(source: ImageSource) -> ImageMetadata:
     """
     Return normalized metadata for a headerless RAW image.
-    """
 
+    The declared RAW layout is also checked against the actual file size.
+    """
+    path = _normalize_source(source)
     shape, dtype = _get_raw_layout(source)
+
+    _validate_raw_file_size(path, shape, dtype)
 
     height, width = shape
 
@@ -390,25 +381,16 @@ def _read_raw(source: ImageSource, path: Path) -> np.ndarray:
     """Read a headerless RAW image using metadata stored in a FrameRecord."""
     shape, dtype = _get_raw_layout(source)
 
+    _validate_raw_file_size(path, shape, dtype)
+
     expected_pixels = shape[0] * shape[1]
-    expected_bytes = expected_pixels * dtype.itemsize
 
     try:
-        actual_bytes = path.stat().st_size
-    except OSError as exc:
-        raise ImageIOError(
-            f"Unable to inspect RAW image file size: {path}: {exc}"
-        ) from exc
-
-    if actual_bytes != expected_bytes:
-        raise ImageIOError(
-            "RAW file size does not match FrameRecord metadata: "
-            f"path={path}, expected_bytes={expected_bytes}, "
-            f"actual_bytes={actual_bytes}, shape={shape}, dtype={dtype}"
+        image = np.fromfile(
+            path,
+            dtype=dtype,
+            count=expected_pixels,
         )
-
-    try:
-        image = np.fromfile(path, dtype=dtype, count=expected_pixels)
     except (OSError, ValueError) as exc:
         raise ImageIOError(
             f"Unable to read RAW image: {path}: {exc}"
@@ -417,7 +399,9 @@ def _read_raw(source: ImageSource, path: Path) -> np.ndarray:
     if image.size != expected_pixels:
         raise ImageIOError(
             "RAW image contains an unexpected number of pixels: "
-            f"path={path}, expected={expected_pixels}, actual={image.size}"
+            f"path={path}, "
+            f"expected={expected_pixels}, "
+            f"actual={image.size}"
         )
 
     return image.reshape(shape)
