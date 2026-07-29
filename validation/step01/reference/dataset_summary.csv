@@ -1,0 +1,8 @@
+dataset,environment,rows,declared_n_frames,frame_index_min,frame_index_max,frame_index_strictly_increasing,frame_index_contiguous,temperature_min_C,temperature_max_C,temperature_median_C,temperature_start_C_values,temperature_end_C_values,exposure_s_values,existing_files,size_valid_files,image_width,image_height,expected_file_size_bytes
+bias_-12dec,cooled,250,250,0.0,249.0,True,True,-12.1,-7.0,-7.1,-12.1,-7.3,3.2e-05,250,0,9576,6388,122342976
+bias_-2dec,cooled,250,250,0.0,249.0,True,True,-2.5,-1.5,-1.8,-2.5,-2.0,3.2e-05,250,0,9576,6388,122342976
+bias_-6dec,cooled,250,250,0.0,249.0,True,True,-6.4,-4.9,-5.2,-6.4,-5.1,3.2e-05,250,0,9576,6388,122342976
+bias_0dec,cooled,250,250,0.0,249.0,True,True,-0.2,2.0,0.0,-0.1,0.0,3.2e-05,250,0,9576,6388,122342976
+bias_10dec,cooled,250,250,0.0,249.0,True,True,8.9,10.2,10.0,9.0,10.0,3.2e-05,250,0,9576,6388,122342976
+bias_3dec,cooled,250,250,0.0,249.0,True,True,2.2,4.0,3.0,2.2,3.0,3.2e-05,250,0,9576,6388,122342976
+bias_7dec,cooled,250,250,0.0,249.0,True,True,6.5,9.5,7.0,8.3,7.0,3.2e-05,250,0,9576,6388,122342976

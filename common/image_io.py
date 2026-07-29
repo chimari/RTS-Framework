@@ -2,8 +2,11 @@
 Image input/output helpers for the RTS Framework.
 
 This implementation provides source normalization, image-format detection,
-two-dimensional FITS image reading, image-shape inspection, and image
-validation. RAW reading will be added in a later milestone.
+two-dimensional FITS and headerless RAW image reading, image-shape inspection,
+and image validation.
+
+Headerless RAW input requires image geometry and pixel-layout metadata from a
+FrameRecord.
 
 Public API
 ----------
@@ -12,12 +15,14 @@ Public API
 - detect_format
 - read_image
 - get_image_shape
+- get_image_metadata
 - validate_image
 """
-
 from __future__ import annotations
+from dataclasses import dataclass
+import sys
 
-__version__ = "0.5.0"
+__version__ = "0.7.1-dev"
 
 from enum import Enum
 from pathlib import Path
@@ -31,6 +36,14 @@ from .manifest import FrameRecord
 
 ImageSource: TypeAlias = str | Path | FrameRecord
 
+@dataclass(frozen=True, slots=True)
+class ImageMetadata:
+    """Normalized image metadata returned by image_io."""
+
+    width: int
+    height: int
+    pixel_dtype: str
+    byte_order: str
 
 class ImageIOError(Exception):
     """Base exception for image-I/O related errors."""
@@ -51,6 +64,22 @@ _FITS_SUFFIXES = frozenset({".fit", ".fits", ".fts"})
 _RAW_SUFFIXES = frozenset({".bin", ".raw", ".dat"})
 
 
+import sys
+
+def _normalize_byte_order(dtype: np.dtype) -> str:
+    symbol = dtype.byteorder
+
+    if symbol == "=":
+        symbol = "<" if sys.byteorder == "little" else ">"
+
+    if symbol == "<":
+        return "little"
+
+    if symbol == ">":
+        return "big"
+
+    return "not_applicable"
+
 def _normalize_source(source: ImageSource) -> Path:
     """
     Convert an image source into a :class:`pathlib.Path`.
@@ -59,7 +88,8 @@ def _normalize_source(source: ImageSource) -> Path:
     ----------
     source
         A path string, ``Path``, or ``FrameRecord``.
-
+        For a ``FrameRecord``, ``resolved_path`` is used for filesystem access.
+    
     Returns
     -------
     pathlib.Path
@@ -71,7 +101,12 @@ def _normalize_source(source: ImageSource) -> Path:
         If ``source`` is not a supported object.
     """
     if isinstance(source, FrameRecord):
-        return source.filepath
+        if source.resolved_path is None:
+            raise ImageIOError(
+                "FrameRecord resolved_path is not available: "
+                f"filepath={source.filepath}"
+            )
+        return source.resolved_path
 
     if isinstance(source, Path):
         return source
@@ -144,15 +179,13 @@ def read_image(source: ImageSource) -> np.ndarray:
     if not path.is_file():
         raise ImageIOError(f"Image file does not exist: {path}")
 
-    image_format = detect_format(path)
+    image_format = detect_format(source)
 
     if image_format is ImageFormat.FITS:
         image = _read_fits(path)
     else:
-        raise NotImplementedError(
-            f"RAW image reading is not implemented yet: {path}"
-        )
-
+        image = _read_raw(source, path)
+    
     image = np.squeeze(np.asarray(image))
 
     if image.ndim != 2:
@@ -168,115 +201,224 @@ def read_image(source: ImageSource) -> np.ndarray:
 
 def get_image_shape(source: ImageSource) -> tuple[int, int]:
     """
-    Return image shape as ``(height, width)`` without loading FITS pixels.
+    Return image shape as ``(height, width)``.
 
-    Singleton axes are removed before the dimensionality check, matching the
-    behavior of :func:`read_image`. For example, ``(1, height, width)`` becomes
-    ``(height, width)``.
+    This is a lightweight wrapper around :func:`get_image_metadata`.
+    """
+    metadata = get_image_metadata(source)
+    return (metadata.height, metadata.width)
+
+def get_image_metadata(source: ImageSource) -> ImageMetadata:
+    """
+    Return normalized image metadata independent of image format.
+
+    Parameters
+    ----------
+    source
+        Image path or FrameRecord.
+
+    Returns
+    -------
+    ImageMetadata
+        Image geometry, dtype and byte order.
     """
     path = _normalize_source(source)
 
     if not path.is_file():
         raise ImageIOError(f"Image file does not exist: {path}")
 
-    image_format = detect_format(path)
+    image_format = detect_format(source)
 
     if image_format is ImageFormat.FITS:
-        shape = _get_fits_shape(path)
-    else:
-        raise NotImplementedError(
-            f"RAW image shape inspection is not implemented yet: {path}"
-        )
+        return _get_fits_metadata(path)
 
-    squeezed_shape = tuple(dimension for dimension in shape if dimension != 1)
-
-    if len(squeezed_shape) != 2:
-        raise ImageIOError(
-            "Image must be two-dimensional after removing singleton axes: "
-            f"path={path}, shape={shape}"
-        )
-
-    return squeezed_shape
+    return _get_raw_metadata(source)
 
 def validate_image(source: ImageSource) -> None:
     """
-    Validate that an image can be read as a two-dimensional array.
+    Validate that an image is readable.
 
-    When ``source`` is a :class:`FrameRecord`, optional image metadata are also
-    checked against the actual image:
+    Raises ImageIOError if the image cannot be opened or is not a
+    supported two-dimensional image.
+    """
 
-    - ``image_width`` and ``image_height``
-    - ``pixel_dtype``
+    get_image_metadata(source)
+    read_image(source)
+
+
+def _get_raw_layout(
+    source: ImageSource,
+) -> tuple[tuple[int, int], np.dtype]:
+    """
+    Return RAW image shape and NumPy dtype from a FrameRecord.
+
+    Headerless RAW files do not contain geometry or dtype metadata. Therefore,
+    RAW input must be supplied as a FrameRecord containing image_width,
+    image_height, pixel_dtype, and optionally byte_order.
+    """
+    if not isinstance(source, FrameRecord):
+        path = _normalize_source(source)
+        raise ImageIOError(
+            "Headerless RAW input requires a FrameRecord containing "
+            "image_width, image_height, pixel_dtype, and byte_order: "
+            f"path={path}"
+        )
+
+    if source.image_width is None or source.image_height is None:
+        raise ImageIOError(
+            "FrameRecord RAW image geometry is incomplete: "
+            f"path={source.filepath}, "
+            f"image_width={source.image_width}, "
+            f"image_height={source.image_height}"
+        )
+
+    if source.image_width <= 0 or source.image_height <= 0:
+        raise ImageIOError(
+            "FrameRecord RAW image dimensions must be positive: "
+            f"path={source.filepath}, "
+            f"image_width={source.image_width}, "
+            f"image_height={source.image_height}"
+        )
+
+    if source.pixel_dtype is None:
+        raise ImageIOError(
+            "FrameRecord RAW pixel_dtype is missing: "
+            f"path={source.filepath}"
+        )
+
+    try:
+        dtype = np.dtype(source.pixel_dtype)
+    except TypeError as exc:
+        raise ImageIOError(
+            "FrameRecord RAW pixel_dtype is not NumPy-compatible: "
+            f"path={source.filepath}, pixel_dtype={source.pixel_dtype!r}"
+        ) from exc
+
+    if source.byte_order in (None, "native", "="):
+        pass
+    elif source.byte_order == "little":
+        dtype = dtype.newbyteorder("<")
+    elif source.byte_order == "big":
+        dtype = dtype.newbyteorder(">")
+    else:
+        raise ImageIOError(
+            "FrameRecord RAW byte_order is unsupported: "
+            f"path={source.filepath}, byte_order={source.byte_order!r}"
+        )
+
+    shape = (source.image_height, source.image_width)
+    return shape, dtype
+
+
+def _validate_raw_file_size(
+    path: Path,
+    shape: tuple[int, int],
+    dtype: np.dtype,
+) -> None:
+    """
+    Validate that a headerless RAW file size matches its declared layout.
 
     Parameters
     ----------
-    source
-        A path string, ``Path``, or ``FrameRecord``.
+    path
+        RAW image file path.
+    shape
+        Expected NumPy image shape as ``(height, width)``.
+    dtype
+        Expected NumPy pixel dtype, including byte order.
 
     Raises
     ------
     ImageIOError
-        If the file is missing, unreadable, unsupported, not two-dimensional,
-        or inconsistent with metadata stored in a ``FrameRecord``.
+        If the file size cannot be inspected or does not match the
+        expected number of bytes.
     """
-    image = read_image(source)
+    expected_pixels = shape[0] * shape[1]
+    expected_bytes = expected_pixels * dtype.itemsize
 
-    if not isinstance(source, FrameRecord):
-        return
-
-    if source.image_width is not None or source.image_height is not None:
-        if source.image_width is None or source.image_height is None:
-            raise ImageIOError(
-                "FrameRecord image geometry is incomplete: "
-                f"path={source.filepath}, "
-                f"image_width={source.image_width}, "
-                f"image_height={source.image_height}"
-            )
-
-        expected_shape = (source.image_height, source.image_width)
-        if image.shape != expected_shape:
-            raise ImageIOError(
-                "Image shape does not match FrameRecord metadata: "
-                f"path={source.filepath}, "
-                f"expected={expected_shape}, actual={image.shape}"
-            )
-
-    if source.pixel_dtype is not None:
-        try:
-            expected_dtype = np.dtype(source.pixel_dtype)
-        except TypeError as exc:
-            raise ImageIOError(
-                "FrameRecord pixel_dtype is not NumPy-compatible: "
-                f"path={source.filepath}, pixel_dtype={source.pixel_dtype!r}"
-            ) from exc
-
-        if image.dtype != expected_dtype:
-            raise ImageIOError(
-                "Image dtype does not match FrameRecord metadata: "
-                f"path={source.filepath}, "
-                f"expected={expected_dtype}, actual={image.dtype}"
-            )
-
-
-def _get_fits_shape(path: Path) -> tuple[int, ...]:
-    """Return the first non-empty FITS image shape without loading pixel data."""
     try:
-        with fits.open(
-            path,
-            mode="readonly",
-            memmap=True,
-            do_not_scale_image_data=True,
-        ) as hdul:
-            for hdu in hdul:
-                shape = tuple(getattr(hdu, "shape", ()) or ())
-                if shape:
-                    return shape
-    except (OSError, ValueError, TypeError) as exc:
+        actual_bytes = path.stat().st_size
+    except OSError as exc:
         raise ImageIOError(
-            f"Unable to inspect FITS image shape: {path}: {exc}"
+            f"Unable to inspect RAW image file size: {path}: {exc}"
         ) from exc
 
-    raise ImageIOError(f"FITS file contains no image data: {path}")
+    if actual_bytes != expected_bytes:
+        height, width = shape
+
+        raise ImageIOError(
+            "RAW file size does not match the declared image layout.\n"
+            f"path            : {path}\n"
+            f"expected layout : {width} x {height} {dtype}\n"
+            f"expected bytes  : {expected_bytes}\n"
+            f"actual bytes    : {actual_bytes}\n"
+            "Check image_width, image_height, and pixel_dtype "
+            "in the FrameRecord."
+        )
+
+    
+def _get_raw_metadata(source: ImageSource) -> ImageMetadata:
+    """
+    Return normalized metadata for a headerless RAW image.
+
+    The declared RAW layout is also checked against the actual file size.
+    """
+    path = _normalize_source(source)
+    shape, dtype = _get_raw_layout(source)
+
+    _validate_raw_file_size(path, shape, dtype)
+
+    height, width = shape
+
+    return ImageMetadata(
+        width=width,
+        height=height,
+        pixel_dtype=dtype.name,
+        byte_order=_normalize_byte_order(dtype),
+    )
+
+def _read_raw(source: ImageSource, path: Path) -> np.ndarray:
+    """Read a headerless RAW image using metadata stored in a FrameRecord."""
+    shape, dtype = _get_raw_layout(source)
+
+    _validate_raw_file_size(path, shape, dtype)
+
+    expected_pixels = shape[0] * shape[1]
+
+    try:
+        image = np.fromfile(
+            path,
+            dtype=dtype,
+            count=expected_pixels,
+        )
+    except (OSError, ValueError) as exc:
+        raise ImageIOError(
+            f"Unable to read RAW image: {path}: {exc}"
+        ) from exc
+
+    if image.size != expected_pixels:
+        raise ImageIOError(
+            "RAW image contains an unexpected number of pixels: "
+            f"path={path}, "
+            f"expected={expected_pixels}, "
+            f"actual={image.size}"
+        )
+
+    return image.reshape(shape)
+
+
+def _get_fits_metadata(path: Path) -> ImageMetadata:
+    """Return normalized metadata for a FITS image."""
+    image = read_image(path)
+    height, width = image.shape
+
+    return ImageMetadata(
+        width=width,
+        height=height,
+        pixel_dtype=image.dtype.name,
+        byte_order=_normalize_byte_order(image.dtype),
+    )
+
 
 def _read_fits(path: Path) -> np.ndarray:
     """Read image data from the first FITS HDU containing an array."""

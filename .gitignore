@@ -11,9 +11,12 @@ build/
 *.fit
 *.bin
 *.csv.gz
+*~
+#*#
 outputs/
 work/
 data/
 learning.db
 *.sqlite*
 !tests/fixtures/**
+*.bak

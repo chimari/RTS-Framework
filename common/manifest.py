@@ -16,7 +16,7 @@ data model and validation API have been reviewed in actual use.
 
 from __future__ import annotations
 
-__version__ = "2.0.0"
+__version__ = "2.0.1"
 
 import csv
 import math
@@ -28,6 +28,30 @@ from typing import Iterable, Iterator, Literal, Mapping, overload
 
 
 IssueSeverity = Literal["error", "warning"]
+
+
+VALID_PIXEL_DTYPES = frozenset(
+    {
+        "uint8",
+        "int8",
+        "uint16",
+        "int16",
+        "uint32",
+        "int32",
+        "uint64",
+        "int64",
+        "float16",
+        "float32",
+        "float64",
+        "complex64",
+        "complex128",
+        "bool",
+    }
+)
+
+VALID_BYTE_ORDERS = frozenset(
+    {"little", "big", "native", "not-applicable"}
+)
 
 
 # ============================================================================
@@ -234,7 +258,12 @@ class FrameRecord:
     exposure_s: float
 
     filename: str
+
+    # Path as written in the Input Manifest.
     filepath: Path
+
+    # Actual filesystem path used internally.
+    resolved_path: Path | None = None
 
     image_width: int | None = None
     image_height: int | None = None
@@ -242,8 +271,18 @@ class FrameRecord:
     byte_order: str | None = None
 
     def __post_init__(self) -> None:
-        """Normalize ``filepath`` while retaining dataclass immutability."""
-        object.__setattr__(self, "filepath", Path(self.filepath))
+        """Normalize image paths while retaining dataclass immutability."""
+
+        filepath = Path(self.filepath)
+
+        resolved_path = (
+            filepath
+            if self.resolved_path is None
+            else Path(self.resolved_path)
+        )
+
+        object.__setattr__(self, "filepath", filepath)
+        object.__setattr__(self, "resolved_path", resolved_path)
 
 
 @dataclass(slots=True, frozen=True)
@@ -571,9 +610,12 @@ class FrameManifest:
             raise ManifestError(
                 f"CSV line {csv_line}: internal filepath conversion failed."
             )
-        values["filepath"] = FrameManifest._resolve_filepath(filepath, frame_root)
+        values["resolved_path"] = FrameManifest._resolve_filepath(
+            filepath,
+            frame_root,
+        )
 
-        return FrameRecord(**values)  # type: ignore[arg-type]
+        return FrameRecord(**values)
 
     @staticmethod
     def _resolve_filepath(filepath: Path, frame_root: Path | None) -> Path:
@@ -943,8 +985,22 @@ class FrameManifest:
                 )
 
             if (
+                frame.pixel_dtype is not None
+                and frame.pixel_dtype not in VALID_PIXEL_DTYPES
+            ):
+                issues.append(
+                    ManifestIssue(
+                        "warning",
+                        "unknown_pixel_dtype",
+                        f"Unrecognized pixel_dtype value: {frame.pixel_dtype!r}.",
+                        row,
+                        dataset,
+                    )
+                )
+
+            if (
                 frame.byte_order is not None
-                and frame.byte_order not in {"little", "big", "native", "not-applicable"}
+                and frame.byte_order not in VALID_BYTE_ORDERS
             ):
                 issues.append(
                     ManifestIssue(
@@ -1104,19 +1160,29 @@ class FrameManifest:
                 )
             )
 
-        geometry_values = {
-            (frame.image_width, frame.image_height)
+        layout_values = {
+            (
+                frame.image_width,
+                frame.image_height,
+                frame.pixel_dtype,
+                frame.byte_order,
+            )
             for frame in frames
-            if frame.image_width is not None and frame.image_height is not None
+            if (
+                frame.image_width is not None
+                and frame.image_height is not None
+                and frame.pixel_dtype is not None
+                and frame.byte_order is not None
+            )
         }
-        if len(geometry_values) > 1:
+        if len(layout_values) > 1:
             issues.append(
                 ManifestIssue(
                     "error",
-                    "inconsistent_image_geometry",
+                    "inconsistent_image_layout",
                     (
-                        "Multiple image geometries are present: "
-                        f"{tuple(sorted(geometry_values))}."
+                        "Multiple image layouts are present: "
+                        f"{tuple(sorted(layout_values))}."
                     ),
                     dataset=dataset.name,
                 )

@@ -1,12 +1,23 @@
 #!/usr/bin/env python3
 """
-Smoke test for common.image_io FITS reading.
+Image input/output helpers for the RTS Framework.
 
-Usage
------
-python tests/test_image_io.py IMAGE_PATH --expect fits
+This implementation provides source normalization, image-format detection,
+two-dimensional FITS and headerless RAW image reading, image-shape inspection,
+and image validation.
+
+Headerless RAW input requires image geometry and pixel-layout metadata from a
+FrameRecord.
+
+Public API
+----------
+- ImageFormat
+- ImageSource
+- detect_format
+- read_image
+- get_image_shape
+- validate_image
 """
-
 from __future__ import annotations
 
 import argparse
@@ -26,16 +37,141 @@ from common.manifest import FrameRecord  # noqa: E402
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Test image normalization, format detection, reading, and validation."
+        description=(
+            "Test image normalization, format detection, reading, "
+            "and validation."
+        )
     )
-    parser.add_argument("image_path", type=Path, help="Image file to inspect.")
+
+    parser.add_argument(
+        "image_path",
+        type=Path,
+        help="Image file to inspect.",
+    )
+
     parser.add_argument(
         "--expect",
         choices=("fits", "raw"),
         default=None,
         help="Optional expected format.",
     )
-    return parser.parse_args()
+
+    parser.add_argument(
+        "--width",
+        type=int,
+        default=None,
+        help="RAW image width in pixels.",
+    )
+
+    parser.add_argument(
+        "--height",
+        type=int,
+        default=None,
+        help="RAW image height in pixels.",
+    )
+
+    parser.add_argument(
+        "--dtype",
+        default=None,
+        help="RAW NumPy pixel dtype, for example uint16.",
+    )
+
+    parser.add_argument(
+        "--byte-order",
+        choices=("native", "little", "big"),
+        default=None,
+        help="RAW byte order.",
+    )
+
+    args = parser.parse_args()
+
+    raw_metadata = (
+        args.width,
+        args.height,
+        args.dtype,
+        args.byte_order,
+    )
+
+    if args.expect == "raw":
+        missing = [
+            name
+            for name, value in (
+                ("--width", args.width),
+                ("--height", args.height),
+                ("--dtype", args.dtype),
+                ("--byte-order", args.byte_order),
+            )
+            if value is None
+        ]
+
+        if missing:
+            parser.error(
+                "RAW input requires: " + ", ".join(missing)
+            )
+
+    elif any(value is not None for value in raw_metadata):
+        parser.error(
+            "--width, --height, --dtype, and --byte-order "
+            "may only be used with --expect raw"
+        )
+
+    if args.width is not None and args.width <= 0:
+        parser.error("--width must be a positive integer")
+
+    if args.height is not None and args.height <= 0:
+        parser.error("--height must be a positive integer")
+
+    if args.dtype is not None:
+        try:
+            np.dtype(args.dtype)
+        except TypeError:
+            parser.error(
+                f"--dtype is not NumPy-compatible: {args.dtype!r}"
+            )
+
+    return args
+
+
+def make_frame_record(
+    source: Path,
+    image: np.ndarray | None,
+    args: argparse.Namespace,
+) -> FrameRecord:
+    """Create a FrameRecord for either FITS or RAW testing."""
+
+    if args.expect == "fits":
+        assert image is not None
+
+        width = image.shape[1]
+        height = image.shape[0]
+        dtype = str(image.dtype)
+        byte_order = "not-applicable"
+
+    else:
+        width = args.width
+        height = args.height
+        dtype = args.dtype
+        byte_order = args.byte_order
+
+    return FrameRecord(
+        manifest_row=0,
+        dataset="smoke-test",
+        directory=str(source.parent),
+        environment="test",
+        frame_index=0,
+        n_frames=1,
+        temperature_C=0.0,
+        temperature_start_C=0.0,
+        temperature_end_C=0.0,
+        temperature_fraction=0.0,
+        exposure_s=1.0,
+        filename=source.name,
+        filepath=source,
+        image_width=width,
+        image_height=height,
+        pixel_dtype=dtype,
+        byte_order=byte_order,
+    )
 
 
 def main() -> int:
@@ -71,9 +207,27 @@ def main() -> int:
     print("   Result     : PASS")
     print()
 
-    print("[3/13] Image reading from Path")
+    primary_label = (
+        "Path"
+        if args.expect == "fits"
+        else "FrameRecord"
+    )
+        
+    print(f"[3/13] Image reading from {primary_label}")
+    frame = None
+
+    if args.expect == "raw":
+        frame = make_frame_record(
+            source=source,
+            image=None,
+            args=args,
+        )
+        
     try:
-        image = image_io.read_image(source)
+        if args.expect == "fits":
+            image = image_io.read_image(source)
+        else:
+            image = image_io.read_image(frame)
 
     except Exception as exc:
         import traceback
@@ -102,46 +256,43 @@ def main() -> int:
     print()
 
     print("[4/13] Image reading from FrameRecord")
-    frame = FrameRecord(
-        manifest_row=0,
-        dataset="smoke-test",
-        directory=str(source.parent),
-        environment="test",
-        frame_index=0,
-        n_frames=1,
-        temperature_C=0.0,
-        temperature_start_C=0.0,
-        temperature_end_C=0.0,
-        temperature_fraction=0.0,
-        exposure_s=1.0,
-        filename=source.name,
-        filepath=source,
-        image_width=image.shape[1],
-        image_height=image.shape[0],
-        pixel_dtype=str(image.dtype),
-        byte_order="not-applicable",
-    )
+    if args.expect == "fits":
+        frame = make_frame_record(
+            source=source,
+            image=image,
+            args=args,
+        )    
 
     frame_image = image_io.read_image(frame)
 
     if not np.array_equal(frame_image, image):
-        print("   Result     : FAIL (FrameRecord result differs from Path result)")
+        print(
+            "   Result     : FAIL "
+            "(FrameRecord result differs from first read)"
+        )
         return 1
 
     print(f"   Source     : {type(frame).__name__}")
     print(f"   Shape      : {frame_image.shape}")
     print(f"   dtype      : {frame_image.dtype}")
-    print("   Match Path : YES")
+    print("   Match first read : YES")
     print("   Result     : PASS")
     print()
 
-    print("[5/13] Image shape from Path")
-    path_shape = image_io.get_image_shape(source)
-    print(f"   Shape      : {path_shape}")
-    print(f"   Match read : {path_shape == image.shape}")
-    if path_shape != image.shape:
+    print(f"[5/13] Image shape from {primary_label}")
+    
+    if args.expect == "fits":
+        primary_shape = image_io.get_image_shape(source)
+    else:
+        primary_shape = image_io.get_image_shape(frame)
+        
+    print(f"   Shape      : {primary_shape}")
+    print(f"   Match read : {primary_shape == image.shape}")
+    
+    if primary_shape != image.shape:
         print("   Result     : FAIL")
         return 1
+    
     print("   Result     : PASS")
     print()
 
@@ -149,15 +300,19 @@ def main() -> int:
     frame_shape = image_io.get_image_shape(frame)
     print(f"   Source     : {type(frame).__name__}")
     print(f"   Shape      : {frame_shape}")
-    print(f"   Match Path : {frame_shape == path_shape}")
-    if frame_shape != path_shape:
+    print(f"   Match first shape : {frame_shape == primary_shape}")
+    if frame_shape != primary_shape:
         print("   Result     : FAIL")
         return 1
     print("   Result     : PASS")
     print()
 
-    print("[7/13] Image validation from Path")
-    image_io.validate_image(source)
+    print(f"[7/13] Image validation from {primary_label}")
+    if args.expect == "fits":
+        image_io.validate_image(source)
+    else:
+        image_io.validate_image(frame)
+
     print("   Result     : PASS")
     print()
 
@@ -169,7 +324,7 @@ def main() -> int:
     print("   Result     : PASS")
     print()
 
-    def expect_image_io_error(label: str, callback) -> bool:
+    def expect_image_io_error(primary_label: str, callback) -> bool:
         try:
             callback()
         except image_io.ImageIOError as exc:
@@ -215,7 +370,11 @@ def main() -> int:
         image_width=image.shape[1] + 1,
         image_height=image.shape[0],
         pixel_dtype=str(image.dtype),
-        byte_order="not-applicable",
+        byte_order = (
+            "not-applicable"
+            if args.expect == "fits"
+            else args.byte_order
+        )        
     )
     if not expect_image_io_error(
         "shape mismatch",
@@ -242,7 +401,11 @@ def main() -> int:
         image_width=image.shape[1],
         image_height=image.shape[0],
         pixel_dtype=wrong_dtype,
-        byte_order="not-applicable",
+        byte_order = (
+            "not-applicable"
+            if args.expect == "fits"
+            else args.byte_order
+        )        
     )
     if not expect_image_io_error(
         "dtype mismatch",
@@ -268,7 +431,11 @@ def main() -> int:
         image_width=image.shape[1],
         image_height=None,
         pixel_dtype=str(image.dtype),
-        byte_order="not-applicable",
+        byte_order = (
+            "not-applicable"
+            if args.expect == "fits"
+            else args.byte_order
+        )
     )
     if not expect_image_io_error(
         "incomplete geometry",
@@ -285,7 +452,7 @@ def main() -> int:
         return 1
 
     print("=" * 72)
-    print("FINISHED: image_io shape and validation tests passed")
+    print("FINISHED: image_io FITS/RAW smoke tests passed")
     print("=" * 72)
     return 0
 

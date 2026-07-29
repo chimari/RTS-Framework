@@ -1,0 +1,21 @@
+{
+  "counts": {
+    "frames_checked": 1750,
+    "image_errors": 0,
+    "manifest_errors": 0,
+    "manifest_warnings": 0
+  },
+  "image_issues": [],
+  "manifest": {
+    "dataset_count": 7,
+    "frame_count": 1750,
+    "frame_root": "/home/taji/work/IMX455/bias",
+    "source_path": "/home/taji/work/IMX455/bias/temperature_index_100us.csv"
+  },
+  "manifest_issues": [],
+  "schema_version": "1.0",
+  "status": "passed",
+  "step": "step01_prepare_dataset",
+  "step_version": "1.4.0",
+  "validation_mode": "shape"
+}
