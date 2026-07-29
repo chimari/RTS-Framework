@@ -7,7 +7,7 @@ No image pixels are read in this step.
 
 from __future__ import annotations
 
-__version__ = "2.7.0"
+__version__ = "2.8.0-dev"
 
 import argparse
 import csv
@@ -191,6 +191,20 @@ def _load_manifest(
         raise Step02Error(f"Unable to load Step 02 manifest: {source}: {exc}") from exc
 
 
+def _require_present(
+    value: object,
+    *,
+    field_name: str,
+    dataset: str,
+) -> object:
+    if value is None:
+        raise Step02Error(
+            f"Dataset {dataset!r} is missing required normalized manifest field "
+            f"{field_name!r}."
+        )
+    return value
+
+
 def _build_group(
     dataset: str,
     frames: list[FrameRecord],
@@ -221,6 +235,32 @@ def _build_group(
         dataset,
         frames,
         "pixel_dtype",
+    )
+    byte_order = _require_single_value(
+        dataset,
+        frames,
+        "byte_order",
+    )
+    
+    image_width = _require_present(
+        image_width,
+        field_name="image_width",
+        dataset=dataset,
+    )
+    image_height = _require_present(
+        image_height,
+        field_name="image_height",
+        dataset=dataset,
+    )
+    pixel_dtype = _require_present(
+        pixel_dtype,
+        field_name="pixel_dtype",
+        dataset=dataset,
+    )
+    byte_order = _require_present(
+        byte_order,
+        field_name="byte_order",
+        dataset=dataset,
     )
     exposure_s = _require_single_value(
         dataset,
@@ -397,7 +437,7 @@ def iter_dataset_images(
             progress(current, total, frame)
 
         try:
-            image = read_image(frame.filepath)
+            image = read_image(frame)
         except Exception as exc:
             raise Step02Error(
                 "Unable to read dataset image: "
@@ -587,7 +627,7 @@ def write_statistics_csv(
                     {
                         "dataset": frame.dataset,
                         "frame_index": frame.frame_index,
-                        "filepath": str(frame.filepath.resolve()),
+                        "filepath": str(frame.filepath),
                         "temperature_C": _format_float(frame.temperature_C),
                         "exposure_s": _format_float(frame.exposure_s),
                         "finite_pixels": frame.finite_pixels,
