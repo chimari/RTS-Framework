@@ -8,7 +8,10 @@ from pathlib import Path
 import numpy as np
 from astropy.io import fits
 
-from common.dataset_characterization import DatasetCharacterization
+from common.dataset_characterization import (
+    DatasetCharacterization,
+    read_dataset_characterization,
+)
 from common.read_noise_analysis import (
     ReadNoiseConfig,
     analyze_read_noise_dataset,
@@ -71,7 +74,20 @@ def test_read_noise_outputs(tmp_path: Path) -> None:
     assert result.status == "PASSED"
     assert result.pairs == 2
     assert (output / "read_noise_summary.csv").is_file()
+    assert (output / "dataset_characterization.json").is_file()
     assert (output / "temporal_noise_map.fits").is_file()
+
+    characterization = read_dataset_characterization(
+        output / "dataset_characterization.json"
+    )
+    assert characterization.dataset == group.name
+    assert characterization.n_frames == group.n_frames
+    assert characterization.pair_noise_median_adu_rms == (
+        result.pair_noise_median_adu_rms
+    )
+    assert characterization.temporal_noise_median_adu_rms == (
+        result.temporal_noise_median_adu_rms
+    )
     assert (
         output / "pair_difference_histogram_full_range_log.png"
     ).is_file()

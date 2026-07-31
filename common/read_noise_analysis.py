@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-__version__ = "1.2.0-dev"
+__version__ = "1.3.0-dev"
 
 import csv
 import json
@@ -17,7 +17,10 @@ import numpy as np
 from astropy.io import fits
 
 from common.image_io import read_image
-from common.dataset_characterization import DatasetCharacterization
+from common.dataset_characterization import (
+    DatasetCharacterization,
+    write_dataset_characterization,
+)
 
 
 MAD_TO_SIGMA = 1.482602218505602
@@ -681,6 +684,11 @@ def analyze_read_noise_dataset(
     (output / "read_noise_summary.json").write_text(
         json.dumps(summary, indent=2, sort_keys=True, allow_nan=False) + "\n",
         encoding="utf-8",
+    )
+
+    write_dataset_characterization(
+        characterization,
+        output / "dataset_characterization.json",
     )
 
     report = [
