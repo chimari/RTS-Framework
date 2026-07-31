@@ -1,173 +1,251 @@
 # RTS Framework
 
-Human-in-the-loop RTS analysis framework for scientific CMOS sensors.
+> Detector-independent scientific framework for astronomical detector characterization
 
-## Migration policy
+**Current milestone:** Step02 completed → Step03 in progress
 
-1. Import the currently validated scripts without changing behavior.
-2. Preserve original filenames and versions under `legacy/steps/`.
-3. Register every step in `config/pipeline_registry.yaml`.
-4. Add smoke tests before refactoring.
-5. Refactor into `src/rtsfw/` only after the legacy pipeline is reproducible.
 
-## GitHub bootstrap
+> **A detector-independent scientific software framework for detecting,
+> characterizing, correcting, and evaluating Random Telegraph Signal (RTS)
+> behavior in astronomical detector images.**
 
-```bash
-git init
-git add .
-git commit -m "chore: bootstrap RTS Framework repository"
-git branch -M main
-git remote add origin <GITHUB_REPOSITORY_URL>
-git push -u origin main
+---
+
+## Overview
+
+RTS Framework is an open scientific software project for the analysis of
+Random Telegraph Signal (RTS) behavior in astronomical imaging detectors.
+
+Unlike detector-specific analysis scripts, RTS Framework is designed as a
+long-term, reusable framework that separates detector-independent
+processing from instrument-specific configuration.
+
+The project emphasizes
+
+- Scientific reproducibility
+- Detector independence
+- Explicit processing pipelines
+- Long-term maintainability
+- Deterministic outputs
+- Scientific validation
+
+The framework is intended to support both detector characterization and
+future astronomical instrument development.
+
+RTS Framework provides reusable infrastructure for
+scientific detector characterization, including
+read-noise analysis, RTS characterization,
+correction, and performance evaluation.
+
+---
+
+## Why RTS Framework?
+
+Most existing RTS analysis software is tightly coupled to a particular
+detector, instrument, or observing campaign.
+
+RTS Framework aims to provide a reusable scientific framework that can be
+applied across different detector systems while maintaining reproducible
+processing and well-defined interfaces.
+
+The project is designed as scientific software rather than as a
+collection of analysis scripts.
+
+---
+
+## Project Status
+
+**Current development status**
+
+| Stage | Status |
+|--------|--------|
+| Common libraries | ✅ Stable |
+| Step01 – Dataset Preparation | ✅ Implemented |
+| Step02 – Statistical Characterization | ✅ Implemented |
+| Step03 – RTS Candidate Detection | 🚧 In Progress |
+| Step04 – RTS State Estimation | Planned |
+| Step05 – RTS Correction | Planned |
+| Step06 – Scientific Evaluation | Planned |
+
+Current milestone:
+
+> **Transition from detector-specific prototype software to a fully
+> detector-independent scientific framework.**
+
+---
+
+## Processing Pipeline
+
+```
+Raw detector images
+        │
+        ▼
+Step01  Dataset Preparation
+        │
+        ▼
+Step02  Statistical Characterization
+        │
+        ▼
+Step03  RTS Candidate Detection
+        │
+        ▼
+Step04  RTS State Estimation
+        │
+        ▼
+Step05  RTS Correction
+        │
+        ▼
+Step06  Scientific Evaluation
 ```
 
+Each processing stage produces explicit scientific artifacts that become
+the documented interface to the following stage.
 
-# Planning Pipeline Framework
+---
 
-Frame Index
-    │
-    ▼
-Raw Statistics
-    │
-    ▼
-Candidate Extraction
-    │
-    ▼
-Time Series
-    │
-    ▼
-Histogram Analysis
-    │
-    ▼
-State Assignment
-    │
-    ▼
-Transition Statistics
-    │
-    ▼
-RTS Classification
-    │
-    ├── Dictionary
-    ├── QA Report
-    └── (Future)
-         Reviewer
-              │
-              ▼
-        Learning Dataset
-              │
-              ▼
-      Threshold Optimizer
+## Main Features
 
-# Development Principles
+Current capabilities include
 
-RTS-Framework is developed as a long-term scientific software project.
-The primary goal is not rapid feature addition, but reproducibility,
-maintainability, and scientific reliability.
+- Detector-independent image I/O
+- FITS and RAW image support
+- Dataset manifest validation
+- Deterministic statistical characterization
+- Python API
+- Command-line interfaces
+- Scientific validation framework
+- Versioned processing artifacts
 
-The following principles guide all development.
+Additional functionality will be introduced incrementally while
+maintaining backward compatibility where practical.
 
-## 1. Legacy parity before refactoring
+---
 
-The first milestone is to reproduce the behavior of the legacy RTS
-pipeline as faithfully as possible.
+## Repository Structure
 
-Refactoring and optimization should only be performed after the legacy
-implementation has been reproduced and verified.
+```
+common/
+    Detector-independent core libraries
 
-## 2. Test first
+steps/
+    Pipeline implementations
 
-Every bug fix or behavior change should be accompanied by a regression
-test.
+tests/
+    Software verification
 
-Whenever practical:
+validation/
+    Scientific validation
 
-1. Write a failing test.
-2. Implement the smallest possible change.
-3. Verify that all tests pass.
+docs/
+    Architecture and design documentation
 
-## 3. One logical change per commit
+tools/
+    Standalone development utilities
+```
 
-Each commit should represent exactly one logical change.
+---
 
-Examples:
+## Installation
 
-- add one regression test
-- fix one bug
-- refactor one module
-- update documentation
+```bash
+git clone <repository>
 
-Avoid mixing unrelated modifications in a single commit.
+cd RTS-Framework
 
-## 4. Detector-independent common modules
+python -m venv .venv
+source .venv/bin/activate
 
-Modules under `common/` must remain detector-independent.
+pip install -e .
+```
 
-Detector-specific algorithms belong in detector-specific modules or
-future pipeline steps.
+---
 
-## 5. Stable public API
+## Quick Start
 
-Public APIs should remain stable within each milestone.
+Run the processing pipeline from the command line.
 
-Breaking changes should be introduced only at clearly defined milestone
-boundaries.
+Dataset preparation:
 
-## 6. Readability over cleverness
+```bash
+python -m steps.step01_prepare_dataset ...
+```
 
-Scientific software is maintained for many years.
+Statistical characterization:
 
-Code should therefore prioritize readability, explicit behavior, and
-clear error messages over clever or highly compact implementations.
+```bash
+python -m steps.step02_prepare_frame_groups ...
+```
 
+Detailed usage examples are available in the pipeline documentation.
 
-# Git Workflow
-
-Development follows a lightweight GitHub workflow.
-
-1. Create an Issue.
-2. Create a feature branch.
-3. Implement one logical change.
-4. Run the test suite.
-5. Commit.
-6. Push.
-7. Open a Pull Request.
-8. Review and merge.
-
-Recommended commit prefixes:
-
-- feat:
-- fix:
-- test:
-- refactor:
-- docs:
-- chore:
-
-
-# Code Review
-
-Every change should be reviewed from two independent viewpoints:
-
-- Scientific correctness
-- Software architecture
-
-A change is considered complete only when both are satisfied.
-
-
-# Project Philosophy
-
-This framework is intended to become a reusable and detector-independent
-RTS analysis framework for scientific CMOS sensors.
-
-The design philosophy is:
-
-Scientific correctness first.
-Software quality second.
-Performance optimization third.
-
-Performance improvements should never compromise reproducibility or
-scientific validity.
-
+---
 
 ## Documentation
 
-- [STEP01 Dataset Preparation](docs/STEP01.md)
+Project documentation is located under `docs/`.
+
+| Document | Description |
+|----------|-------------|
+| `ARCHITECTURE.md` | Overall software architecture |
+| `DECISIONS.md` | Major architectural decisions |
+| `STEP01.md` – `STEP06.md` | Pipeline specifications |
+| `developer_guide.md` | Development guide |
+
+AGENTS.md
+        │
+ARCHITECTURE.md
+        │
+Pipeline Specifications
+        │
+Implementation
+        │
+Tests
+        │
+Scientific Validation
+
+---
+
+## Development Philosophy
+
+RTS Framework follows several guiding principles.
+
+- Correctness before optimization
+- Explicit processing stages
+- Detector-independent design
+- Reproducible scientific outputs
+- Small reviewable changes
+- Documentation before implementation
+
+Documentation is treated as part of the implementation.
+
+---
+
+## Contributing
+
+Contributors should consult
+
+- `AGENTS.md`
+- `docs/ARCHITECTURE.md`
+- `docs/DECISIONS.md`
+
+before implementing new functionality.
+
+New features should normally include
+
+- documentation
+- automated tests
+- scientific validation where appropriate
+
+---
+
+## Acknowledgements
+
+RTS Framework is being developed as a long-term scientific software
+project for astronomical detector characterization and future
+instrumentation development.
+
+---
+
+## License
+
+(To be determined.)

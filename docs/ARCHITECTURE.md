@@ -13,6 +13,38 @@ Its architecture emphasizes reproducibility, maintainability,
 detector-independent components, explicit processing stages, and
 scientific validation.
 
+## Core Philosophy
+
+RTS-Framework distinguishes between
+scientific data production and human-oriented presentation.
+
+Processing Steps generate deterministic,
+machine-readable scientific artifacts.
+
+Standalone scripts consume these artifacts to produce
+diagnostic plots, reports, visualizations,
+and exploratory analyses.
+
+Steps produce data.
+Scripts present data.
+
+---
+
+## Pipeline Contracts
+
+Each processing Step communicates only through
+well-defined data products.
+
+A Step shall not depend on the internal implementation
+of another Step.
+
+Subsequent Steps consume documented artifacts rather
+than recomputing previously established quantities.
+
+This design improves reproducibility,
+testability,
+and long-term maintainability.
+
 ---
 
 ## Design Goals
@@ -84,6 +116,22 @@ RTS-Framework separates:
 - detector-independent logic from detector-specific configuration;
 - permanent repository artifacts from large external datasets.
 
+### Pipeline Philosophy
+
+The primary responsibility of the pipeline is to generate
+deterministic machine-readable products that serve
+as inputs to subsequent processing steps. Each Step produces
+structured data intended for automated processing,
+not human inspection.
+
+Diagnostic figures, plots, interactive visualizations,
+summary reports, and other human-oriented outputs
+are intentionally implemented as standalone scripts outside the pipeline.
+These scripts consume the pipeline products without modifying them.
+
+Steps produce data.
+Scripts present data.
+
 ### Documentation First
 
 Changes affecting architecture, public interfaces, validation policy,
@@ -116,26 +164,26 @@ validation cases, and documentation.
 
 Conceptually, the architecture is:
 
-    User or Automation
-            |
-            v
-       CLI or Public API
-            |
-            v
-      Processing Steps
-            |
-            +-------------------+
-            |                   |
-            v                   v
-       Common Modules         Tools
-            |                   |
-            +---------+---------+
-                      |
-                      v
-              Scientific Artifacts
-                      |
-                      v
-              Validation Procedures
+                CLI
+
+                 │
+
+        +--------+--------+
+
+        │                 │
+
+      Steps          Standalone Scripts
+
+        │                 │
+
+        ▼                 ▼
+
+ Scientific Artifacts   Reports / Figures
+        ▲
+
+        │
+
+ Validation
 
 The command-line interface and public APIs provide controlled entry
 points into the framework.
@@ -161,6 +209,9 @@ The repository is organized by responsibility.
 
     steps/
         Processing-step implementations and orchestration.
+
+    scripts/
+        Human-oriented analysis tools
 
     tests/
         Unit and integration tests for software behavior.
@@ -192,7 +243,7 @@ RTS-Framework is divided into six primary processing stages.
     Step01: Dataset Preparation
             |
             v
-    Step02: Statistical Characterization
+    Step02: Dataset Characterization
             |
             v
     Step03: RTS Candidate Detection
@@ -217,14 +268,15 @@ Primary artifact:
 
     normalized_manifest.csv
 
-### Step02: Statistical Characterization
+### Step02: Dataset Characterization
 
 Step02 reads the registered image sequence and computes deterministic
 statistical quantities required by downstream processing.
 
-Primary artifact:
+Primary artifacts:
 
-    statistics.csv
+    Dataset statistics
+    Dataset characterization
 
 ### Step03: RTS Candidate Detection
 
@@ -272,17 +324,20 @@ reviewed as an architectural change.
 
 The framework follows a layered dependency model.
 
-    Layer 4
-    Scientific evaluation and release qualification
+    Layer 5
+    Visualization and Analysis Scripts
 
-    Layer 3
-    Processing steps and workflow orchestration
+    Layer 4
+    Validation and Evaluation
+
+    Layer 3    	   
+    Pipeline Steps
 
     Layer 2
-    Shared scientific algorithms and data handling
+    Scientific Algorithms
 
     Layer 1
-    Image I/O, manifests, formats, errors, and utilities
+    Image I/O
 
 Lower layers should not depend on higher layers.
 
@@ -514,15 +569,14 @@ Documentation and implementation should evolve together.
 
 The architecture is being established incrementally.
 
-Current work includes:
+Current work includes
 
-- reusable image I/O;
-- manifest normalization;
-- Step01 implementation and documentation;
-- Step02 statistical processing;
-- software tests;
-- comparison utilities;
-- the validation documentation structure.
+- image I/O
+- Step01
+- Step02 Dataset Characterization
+- read noise characterization
+- deterministic pipeline architecture
+- documentation
 
 Later pipeline steps remain subject to milestone-driven design and
 implementation.
