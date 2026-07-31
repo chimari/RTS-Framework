@@ -61,7 +61,7 @@ def _manifest_row(
         "image_width": 5,
         "image_height": 4,
         "pixel_dtype": "uint16",
-        "byte_order": "not-applicable",
+        "byte_order": sys.byteorder,
     }
 
 

@@ -76,6 +76,25 @@ class FrameLevelRecord:
     level_adu: float
 
 
+from typing import Any
+
+@dataclass(slots=True)
+class _AnalysisContext:
+    """Intermediate results produced by dataset analysis."""
+
+    frame_levels: list[FrameLevelRecord]
+
+    pair_values: np.ndarray
+
+    temporal_noise: np.ndarray
+
+    temporal_finite: np.ndarray
+
+    quantization: dict[str, Any]
+
+    histogram_samples: list[np.ndarray]
+
+    
 @dataclass(frozen=True, slots=True)
 class ReadNoiseResult:
     dataset: str
@@ -265,6 +284,108 @@ def _quantization_summary(values: np.ndarray):
             spacing * math.sqrt(2.0) if np.isfinite(spacing) else float("nan")
         ),
     }, rows
+
+
+def _analyze_dataset(
+    group: DatasetGroupLike,
+    config: ReadNoiseConfig,
+    *,
+    progress: ProgressCallback | None = None,
+) -> _AnalysisContext:
+    frame_levels: list[FrameLevelRecord] = []
+    for current, frame in enumerate(group.frames, start=1):
+        if progress is not None:
+            progress(current, group.n_frames, frame)
+        image = read_image(frame)
+        if tuple(image.shape) != tuple(group.image_shape):
+            raise ReadNoiseAnalysisError(
+                f"Image shape changed: {frame.filepath}: "
+                f"expected={group.image_shape}, actual={image.shape}"
+            )
+        cropped = image[y:y + height, x:x + width]
+        corrected, level = _correct_level(
+            cropped, config.frame_level_correction
+        )
+        frames[current - 1] = corrected
+        frame_levels.append(
+            FrameLevelRecord(
+                frame_index=frame.frame_index,
+                filename=frame.filepath.name,
+                temperature_C=frame.temperature_C,
+                level_adu=level,
+            )
+        )
+    frames.flush()
+
+    pair_records: list[PairNoiseRecord] = []
+    histogram_samples: list[np.ndarray] = []
+    first_pair_difference = None
+
+    for pair_index in range(group.n_frames // 2):
+        a = pair_index * 2
+        b = a + 1
+        difference = (
+            frames[a].astype(np.float64) - frames[b].astype(np.float64)
+        ) / math.sqrt(2.0)
+        if first_pair_difference is None:
+            first_pair_difference = difference.astype(np.float32)
+        clipped = _clip_pair(difference.ravel(), config.clip_sigma)
+        frame_a = group.frames[a]
+        frame_b = group.frames[b]
+        pair_records.append(
+            PairNoiseRecord(
+                pair_index=pair_index,
+                frame_index_a=frame_a.frame_index,
+                frame_index_b=frame_b.frame_index,
+                filename_a=frame_a.filepath.name,
+                filename_b=frame_b.filepath.name,
+                pair_offset_median_adu=clipped["center"],
+                initial_sigma_adu_rms=clipped["initial_sigma"],
+                noise_adu_rms=clipped["sigma"],
+                clip_lower_adu=clipped["lower"],
+                clip_upper_adu=clipped["upper"],
+                total_pixels=clipped["total"],
+                kept_pixels=clipped["kept"],
+                rejected_pixels=clipped["rejected"],
+                rejected_fraction=clipped["rejected"] / clipped["total"],
+            )
+        )
+        # Deterministic bounded plotting sample; science statistics use all pixels.
+        flat = difference.ravel()
+        stride = max(1, flat.size // 250_000)
+        histogram_samples.append(flat[::stride])
+
+    if config.temporal_chunk_rows <= 0:
+        raise ReadNoiseAnalysisError("temporal_chunk_rows must be positive.")
+    temporal_path = output / ".temporal_noise.npy"
+    temporal_noise = np.lib.format.open_memmap(
+        temporal_path, mode="w+", dtype=np.float32, shape=(height, width)
+    )
+    for row0 in range(0, height, config.temporal_chunk_rows):
+        row1 = min(height, row0 + config.temporal_chunk_rows)
+        block = np.asarray(frames[:, row0:row1, :], dtype=np.float32)
+        temporal_noise[row0:row1] = np.asarray(
+            robust_std(block, axis=0), dtype=np.float32
+        )
+    temporal_noise.flush()
+    pair_values = np.asarray(
+        [record.noise_adu_rms for record in pair_records], dtype=np.float64
+    )
+    rejected = sum(record.rejected_pixels for record in pair_records)
+    total = sum(record.total_pixels for record in pair_records)
+    temporal_finite = temporal_noise[np.isfinite(temporal_noise)]
+    temporal_p = np.percentile(temporal_finite, [1, 5, 16, 84, 95, 99])
+    pair_sample = np.concatenate(histogram_samples)
+    quantization, level_rows = _quantization_summary(pair_sample)
+
+    return _AnalysisContext(
+        frame_levels=frame_levels,
+        pair_values=pair_values,
+        temporal_noise=temporal_noise,
+        temporal_finite=temporal_finite,
+        quantization=quantization,
+        histogram_samples=histogram_samples,
+    )
 
 
 def _build_dataset_characterization(
