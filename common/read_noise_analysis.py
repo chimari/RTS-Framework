@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-__version__ = "1.3.0-dev"
+__version__ = "1.5.0-dev"
 
 import csv
 import json
@@ -86,10 +86,13 @@ class _AnalysisContext:
     """Intermediate results produced by dataset analysis."""
 
     frame_levels: list[FrameLevelRecord]
+    pair_records: list[PairNoiseRecord]
     pair_values: np.ndarray
+    first_pair_difference: np.ndarray | None
     temporal_noise: np.ndarray
     temporal_finite: np.ndarray
     quantization: dict[str, Any]
+    quantization_level_rows: list[dict[str, Any]]
     histogram_samples: list[np.ndarray]
     temporal_path: Path
     
@@ -343,6 +346,7 @@ def _analyze_dataset(
 
         pair_records: list[PairNoiseRecord] = []
         histogram_samples: list[np.ndarray] = []
+        first_pair_difference: np.ndarray | None = None
 
         for pair_index in range(group.n_frames // 2):
             a = pair_index * 2
@@ -351,6 +355,9 @@ def _analyze_dataset(
                 frames[a].astype(np.float64)
                 - frames[b].astype(np.float64)
             ) / math.sqrt(2.0)
+
+            if first_pair_difference is None:
+                first_pair_difference = difference.astype(np.float32)
 
             clipped = _clip_pair(difference.ravel(), config.clip_sigma)
             frame_a = group.frames[a]
@@ -412,14 +419,17 @@ def _analyze_dataset(
             )
 
         pair_sample = np.concatenate(histogram_samples)
-        quantization, _ = _quantization_summary(pair_sample)
+        quantization, level_rows = _quantization_summary(pair_sample)
 
         return _AnalysisContext(
             frame_levels=frame_levels,
+            pair_records=pair_records,
             pair_values=pair_values,
+            first_pair_difference=first_pair_difference,
             temporal_noise=temporal_noise,
             temporal_finite=temporal_finite,
             quantization=quantization,
+            quantization_level_rows=level_rows,
             histogram_samples=histogram_samples,
             temporal_path=temporal_path,
         )
@@ -505,128 +515,27 @@ def characterize_dataset(
         temporal_path.unlink(missing_ok=True)
 
 
-def analyze_read_noise_dataset(
+def _build_read_noise_summary(
+    *,
     group: DatasetGroupLike,
     config: ReadNoiseConfig,
-    *,
-    progress: ProgressCallback | None = None,
-) -> ReadNoiseResult:
-    """Analyze one immutable Step 02 dataset group and write science outputs."""
-    if group.n_frames < 2:
-        raise ReadNoiseAnalysisError("At least two frames are required.")
-    if config.clip_sigma <= 0:
-        raise ReadNoiseAnalysisError("clip_sigma must be positive.")
-    if config.hist_bins <= 0:
-        raise ReadNoiseAnalysisError("hist_bins must be positive.")
-
-    output = Path(config.output_dir)
-    output.mkdir(parents=True, exist_ok=True)
-    roi = _resolve_roi(group.image_shape, config.roi)
+    roi: tuple[int, int, int, int],
+    context: _AnalysisContext,
+) -> dict[str, Any]:
+    """Build the detailed Step 02 read-noise summary."""
     x, y, width, height = roi
+    pair_records = context.pair_records
+    pair_values = context.pair_values
+    temporal_finite = context.temporal_finite
 
-    stack_path = output / ".read_noise_stack.npy"
-    frames = np.lib.format.open_memmap(
-        stack_path,
-        mode="w+",
-        dtype=np.float32,
-        shape=(group.n_frames, height, width),
-    )
-    frame_levels: list[FrameLevelRecord] = []
-    for current, frame in enumerate(group.frames, start=1):
-        if progress is not None:
-            progress(current, group.n_frames, frame)
-        image = read_image(frame)
-        if tuple(image.shape) != tuple(group.image_shape):
-            raise ReadNoiseAnalysisError(
-                f"Image shape changed: {frame.filepath}: "
-                f"expected={group.image_shape}, actual={image.shape}"
-            )
-        cropped = image[y:y + height, x:x + width]
-        corrected, level = _correct_level(
-            cropped, config.frame_level_correction
-        )
-        frames[current - 1] = corrected
-        frame_levels.append(
-            FrameLevelRecord(
-                frame_index=frame.frame_index,
-                filename=frame.filepath.name,
-                temperature_C=frame.temperature_C,
-                level_adu=level,
-            )
-        )
-    frames.flush()
-
-    pair_records: list[PairNoiseRecord] = []
-    histogram_samples: list[np.ndarray] = []
-    first_pair_difference = None
-
-    for pair_index in range(group.n_frames // 2):
-        a = pair_index * 2
-        b = a + 1
-        difference = (
-            frames[a].astype(np.float64) - frames[b].astype(np.float64)
-        ) / math.sqrt(2.0)
-        if first_pair_difference is None:
-            first_pair_difference = difference.astype(np.float32)
-        clipped = _clip_pair(difference.ravel(), config.clip_sigma)
-        frame_a = group.frames[a]
-        frame_b = group.frames[b]
-        pair_records.append(
-            PairNoiseRecord(
-                pair_index=pair_index,
-                frame_index_a=frame_a.frame_index,
-                frame_index_b=frame_b.frame_index,
-                filename_a=frame_a.filepath.name,
-                filename_b=frame_b.filepath.name,
-                pair_offset_median_adu=clipped["center"],
-                initial_sigma_adu_rms=clipped["initial_sigma"],
-                noise_adu_rms=clipped["sigma"],
-                clip_lower_adu=clipped["lower"],
-                clip_upper_adu=clipped["upper"],
-                total_pixels=clipped["total"],
-                kept_pixels=clipped["kept"],
-                rejected_pixels=clipped["rejected"],
-                rejected_fraction=clipped["rejected"] / clipped["total"],
-            )
-        )
-        # Deterministic bounded plotting sample; science statistics use all pixels.
-        flat = difference.ravel()
-        stride = max(1, flat.size // 250_000)
-        histogram_samples.append(flat[::stride])
-
-    if config.temporal_chunk_rows <= 0:
-        raise ReadNoiseAnalysisError("temporal_chunk_rows must be positive.")
-    temporal_path = output / ".temporal_noise.npy"
-    temporal_noise = np.lib.format.open_memmap(
-        temporal_path, mode="w+", dtype=np.float32, shape=(height, width)
-    )
-    for row0 in range(0, height, config.temporal_chunk_rows):
-        row1 = min(height, row0 + config.temporal_chunk_rows)
-        block = np.asarray(frames[:, row0:row1, :], dtype=np.float32)
-        temporal_noise[row0:row1] = np.asarray(
-            robust_std(block, axis=0), dtype=np.float32
-        )
-    temporal_noise.flush()
-    pair_values = np.asarray(
-        [record.noise_adu_rms for record in pair_records], dtype=np.float64
-    )
     rejected = sum(record.rejected_pixels for record in pair_records)
     total = sum(record.total_pixels for record in pair_records)
-    temporal_finite = temporal_noise[np.isfinite(temporal_noise)]
-    temporal_p = np.percentile(temporal_finite, [1, 5, 16, 84, 95, 99])
-    pair_sample = np.concatenate(histogram_samples)
-    quantization, level_rows = _quantization_summary(pair_sample)
-
-    characterization = _build_dataset_characterization(
-        group=group,
-        frame_levels=frame_levels,
-        pair_values=pair_values,
-        temporal_finite=temporal_finite,
-        temporal_noise=temporal_noise,
-        quantization=quantization,
+    temporal_p = np.percentile(
+        temporal_finite,
+        [1, 5, 16, 84, 95, 99],
     )
-    
-    summary = {
+
+    return {
         "schema": "rts-framework.read-noise-summary",
         "schema_version": 1,
         "analysis_version": __version__,
@@ -646,99 +555,169 @@ def analyze_read_noise_dataset(
         "roi_height": height,
         "frame_level_correction": config.frame_level_correction,
         "clip_sigma": config.clip_sigma,
-        "pair_noise_median_adu_rms": float(np.median(pair_values)),
+        "pair_noise_median_adu_rms": float(
+            np.median(pair_values)
+        ),
         "pair_noise_mean_adu_rms": float(np.mean(pair_values)),
-        "pair_noise_p16_adu_rms": float(np.percentile(pair_values, 16)),
-        "pair_noise_p84_adu_rms": float(np.percentile(pair_values, 84)),
+        "pair_noise_p16_adu_rms": float(
+            np.percentile(pair_values, 16)
+        ),
+        "pair_noise_p84_adu_rms": float(
+            np.percentile(pair_values, 84)
+        ),
         "clipping_rejected_pixels": rejected,
         "clipping_total_pixels": total,
         "clipping_rejected_fraction": rejected / total,
         "pair_median_rejected_fraction": float(
-            np.median([record.rejected_fraction for record in pair_records])
+            np.median(
+                [
+                    record.rejected_fraction
+                    for record in pair_records
+                ]
+            )
         ),
         "pair_max_rejected_fraction": float(
-            np.max([record.rejected_fraction for record in pair_records])
+            np.max(
+                [
+                    record.rejected_fraction
+                    for record in pair_records
+                ]
+            )
         ),
-        "temporal_noise_median_adu_rms": float(np.median(temporal_finite)),
-        "temporal_noise_mean_adu_rms": float(np.mean(temporal_finite)),
+        "temporal_noise_median_adu_rms": float(
+            np.median(temporal_finite)
+        ),
+        "temporal_noise_mean_adu_rms": float(
+            np.mean(temporal_finite)
+        ),
         "temporal_noise_p01_adu_rms": float(temporal_p[0]),
         "temporal_noise_p05_adu_rms": float(temporal_p[1]),
         "temporal_noise_p16_adu_rms": float(temporal_p[2]),
         "temporal_noise_p84_adu_rms": float(temporal_p[3]),
         "temporal_noise_p95_adu_rms": float(temporal_p[4]),
         "temporal_noise_p99_adu_rms": float(temporal_p[5]),
-        "temporal_noise_max_adu_rms": float(np.max(temporal_finite)),
-        **quantization,
+        "temporal_noise_max_adu_rms": float(
+            np.max(temporal_finite)
+        ),
+        **context.quantization,
     }
 
+
+def _write_read_noise_tables(
+    *,
+    output: Path,
+    context: _AnalysisContext,
+    summary: dict[str, Any],
+) -> None:
+    """Write CSV and JSON table products."""
     _write_rows(
         output / "frame_level.csv",
-        [asdict(record) for record in frame_levels],
+        [asdict(record) for record in context.frame_levels],
     )
     _write_rows(
         output / "pair_noise_values.csv",
-        [asdict(record) for record in pair_records],
+        [asdict(record) for record in context.pair_records],
     )
-    _write_rows(output / "pair_value_levels.csv", level_rows)
+    _write_rows(
+        output / "pair_value_levels.csv",
+        context.quantization_level_rows,
+    )
     _write_rows(output / "read_noise_summary.csv", [summary])
     (output / "read_noise_summary.json").write_text(
-        json.dumps(summary, indent=2, sort_keys=True, allow_nan=False) + "\n",
+        json.dumps(
+            summary,
+            indent=2,
+            sort_keys=True,
+            allow_nan=False,
+        )
+        + "\n",
         encoding="utf-8",
     )
 
-    write_dataset_characterization(
-        characterization,
-        output / "dataset_characterization.json",
-    )
 
+def _write_read_noise_report(
+    *,
+    output: Path,
+    group: DatasetGroupLike,
+    config: ReadNoiseConfig,
+    roi: tuple[int, int, int, int],
+    pair_count: int,
+    summary: dict[str, Any],
+) -> None:
+    """Write the human-readable Step 02 report."""
     report = [
         "RTS Framework robust read-noise characterization",
         "================================================",
         f"Dataset                         : {group.name}",
-        f"Frames / pairs                  : {group.n_frames} / {len(pair_records)}",
+        f"Frames / pairs                  : "
+        f"{group.n_frames} / {pair_count}",
         f"ROI (x,y,w,h)                   : {roi}",
-        f"Frame-level correction          : {config.frame_level_correction}",
-        f"Pair noise median [ADU rms]     : {summary['pair_noise_median_adu_rms']:.9g}",
-        f"Overall rejected fraction       : {100 * summary['clipping_rejected_fraction']:.9g} %",
-        f"Temporal noise median [ADU rms] : {summary['temporal_noise_median_adu_rms']:.9g}",
+        f"Frame-level correction          : "
+        f"{config.frame_level_correction}",
+        f"Pair noise median [ADU rms]     : "
+        f"{summary['pair_noise_median_adu_rms']:.9g}",
+        f"Overall rejected fraction       : "
+        f"{100 * summary['clipping_rejected_fraction']:.9g} %",
+        f"Temporal noise median [ADU rms] : "
+        f"{summary['temporal_noise_median_adu_rms']:.9g}",
         "",
-        "The rejected fraction is an outlier-quality indicator, not an RTS rate.",
-        "No spatial median filter, RTS classification, or RTS mask is applied.",
-        "Standard histograms display P0.1..P99.9; full-range output is separate.",
+        "The rejected fraction is an outlier-quality indicator, "
+        "not an RTS rate.",
+        "No spatial median filter, RTS classification, or RTS "
+        "mask is applied.",
+        "Standard histograms display P0.1..P99.9; full-range "
+        "output is separate.",
     ]
     (output / "read_noise_report.txt").write_text(
-        "\n".join(report) + "\n", encoding="utf-8"
+        "\n".join(report) + "\n",
+        encoding="utf-8",
     )
 
+
+def _write_read_noise_plots(
+    *,
+    output: Path,
+    config: ReadNoiseConfig,
+    context: _AnalysisContext,
+) -> None:
+    """Write all Step 02 diagnostic plots."""
     _save_line_plot(
-        [record.frame_index for record in frame_levels],
-        [record.level_adu for record in frame_levels],
+        [record.frame_index for record in context.frame_levels],
+        [record.level_adu for record in context.frame_levels],
         output / "frame_level_drift.png",
         xlabel="Frame index",
         ylabel="Removed frame level [ADU]",
         title="Frame-level drift",
     )
     _save_line_plot(
-        [record.pair_index for record in pair_records],
-        [record.noise_adu_rms for record in pair_records],
+        [record.pair_index for record in context.pair_records],
+        [record.noise_adu_rms for record in context.pair_records],
         output / "pair_noise_by_pair.png",
         xlabel="Pair index",
         ylabel="Robust pair noise [ADU rms]",
         title="Pair-difference noise",
     )
     _save_line_plot(
-        [record.pair_index for record in pair_records],
-        [100 * record.rejected_fraction for record in pair_records],
+        [record.pair_index for record in context.pair_records],
+        [
+            100 * record.rejected_fraction
+            for record in context.pair_records
+        ],
         output / "pair_rejected_fraction_by_pair.png",
         xlabel="Pair index",
         ylabel="Rejected pixels [%]",
         title="MAD clipping rejection fraction",
     )
 
-    for filename, log_y, range_ in (
+    pair_sample = np.concatenate(context.histogram_samples)
+    for filename, log_y, percentile_range in (
         ("pair_difference_histogram.png", False, (0.1, 99.9)),
         ("pair_difference_histogram_log.png", True, (0.1, 99.9)),
-        ("pair_difference_histogram_full_range_log.png", True, None),
+        (
+            "pair_difference_histogram_full_range_log.png",
+            True,
+            None,
+        ),
     ):
         _save_histogram(
             pair_sample,
@@ -747,38 +726,40 @@ def analyze_read_noise_dataset(
             title="Pair-difference distribution",
             bins=config.hist_bins,
             log_y=log_y,
-            percentile_range=range_,
+            percentile_range=percentile_range,
         )
 
     fig, ax = plt.subplots(figsize=(8, 6))
-    vmin, vmax = np.percentile(temporal_finite, [1, 99])
+    vmin, vmax = np.percentile(
+        context.temporal_finite,
+        [1, 99],
+    )
     shown = ax.imshow(
-        temporal_noise, origin="lower", vmin=float(vmin), vmax=float(vmax)
+        context.temporal_noise,
+        origin="lower",
+        vmin=float(vmin),
+        vmax=float(vmax),
     )
     ax.set(
         xlabel="ROI x pixel",
         ylabel="ROI y pixel",
         title="Per-pixel robust temporal noise",
     )
-    fig.colorbar(shown, ax=ax, label="Temporal noise [ADU rms]")
+    fig.colorbar(
+        shown,
+        ax=ax,
+        label="Temporal noise [ADU rms]",
+    )
     fig.tight_layout()
     fig.savefig(output / "temporal_noise_map.png", dpi=160)
     plt.close(fig)
-
-    fits.PrimaryHDU(temporal_noise).writeto(
-        output / "temporal_noise_map.fits", overwrite=True
-    )
-    if first_pair_difference is not None:
-        fits.PrimaryHDU(first_pair_difference).writeto(
-            output / "pair_difference_0000.fits", overwrite=True
-        )
 
     for filename, log_y in (
         ("temporal_noise_histogram.png", False),
         ("temporal_noise_histogram_log.png", True),
     ):
         _save_histogram(
-            temporal_noise,
+            context.temporal_noise,
             output / filename,
             xlabel="Per-pixel temporal noise [ADU rms]",
             title="Temporal-noise distribution",
@@ -787,21 +768,129 @@ def analyze_read_noise_dataset(
             percentile_range=(0.1, 99.9),
         )
 
-    # Temporary NumPy memmaps are internal implementation details.
-    del frames
-    del temporal_noise
-    stack_path.unlink(missing_ok=True)
-    temporal_path.unlink(missing_ok=True)
 
-    return ReadNoiseResult(
-        dataset=group.name,
-        status="PASSED",
-        frames=group.n_frames,
-        pairs=len(pair_records),
-        pair_noise_median_adu_rms=summary["pair_noise_median_adu_rms"],
-        clipping_rejected_fraction=summary["clipping_rejected_fraction"],
-        temporal_noise_median_adu_rms=summary[
-            "temporal_noise_median_adu_rms"
-        ],
-        output_directory=str(output),
+def _write_read_noise_fits(
+    *,
+    output: Path,
+    context: _AnalysisContext,
+) -> None:
+    """Write Step 02 FITS data products."""
+    fits.PrimaryHDU(context.temporal_noise).writeto(
+        output / "temporal_noise_map.fits",
+        overwrite=True,
     )
+    if context.first_pair_difference is not None:
+        fits.PrimaryHDU(
+            context.first_pair_difference
+        ).writeto(
+            output / "pair_difference_0000.fits",
+            overwrite=True,
+        )
+
+
+def _write_read_noise_outputs(
+    *,
+    output: Path,
+    group: DatasetGroupLike,
+    config: ReadNoiseConfig,
+    roi: tuple[int, int, int, int],
+    context: _AnalysisContext,
+    characterization: DatasetCharacterization,
+    summary: dict[str, Any],
+) -> None:
+    """Write the complete deterministic Step 02 output set."""
+    _write_read_noise_tables(
+        output=output,
+        context=context,
+        summary=summary,
+    )
+    write_dataset_characterization(
+        characterization,
+        output / "dataset_characterization.json",
+    )
+    _write_read_noise_report(
+        output=output,
+        group=group,
+        config=config,
+        roi=roi,
+        pair_count=len(context.pair_records),
+        summary=summary,
+    )
+    _write_read_noise_plots(
+        output=output,
+        config=config,
+        context=context,
+    )
+    _write_read_noise_fits(
+        output=output,
+        context=context,
+    )
+
+
+def analyze_read_noise_dataset(
+    group: DatasetGroupLike,
+    config: ReadNoiseConfig,
+    *,
+    progress: ProgressCallback | None = None,
+) -> ReadNoiseResult:
+    """Analyze one immutable Step 02 dataset and write science outputs."""
+    if config.hist_bins <= 0:
+        raise ReadNoiseAnalysisError("hist_bins must be positive.")
+
+    output = Path(config.output_dir)
+    output.mkdir(parents=True, exist_ok=True)
+    roi = _resolve_roi(group.image_shape, config.roi)
+
+    context = _analyze_dataset(
+        group,
+        config,
+        progress=progress,
+    )
+    temporal_path = context.temporal_path
+
+    try:
+        characterization = _build_dataset_characterization(
+            group=group,
+            frame_levels=context.frame_levels,
+            pair_values=context.pair_values,
+            temporal_finite=context.temporal_finite,
+            temporal_noise=context.temporal_noise,
+            quantization=context.quantization,
+        )
+        summary = _build_read_noise_summary(
+            group=group,
+            config=config,
+            roi=roi,
+            context=context,
+        )
+
+        _write_read_noise_outputs(
+            output=output,
+            group=group,
+            config=config,
+            roi=roi,
+            context=context,
+            characterization=characterization,
+            summary=summary,
+        )
+
+        return ReadNoiseResult(
+            dataset=group.name,
+            status="PASSED",
+            frames=group.n_frames,
+            pairs=len(context.pair_records),
+            pair_noise_median_adu_rms=summary[
+                "pair_noise_median_adu_rms"
+            ],
+            clipping_rejected_fraction=summary[
+                "clipping_rejected_fraction"
+            ],
+            temporal_noise_median_adu_rms=summary[
+                "temporal_noise_median_adu_rms"
+            ],
+            output_directory=str(output),
+        )
+    finally:
+        del context
+        temporal_path.unlink(missing_ok=True)
+

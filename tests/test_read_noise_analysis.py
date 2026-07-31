@@ -73,9 +73,30 @@ def test_read_noise_outputs(tmp_path: Path) -> None:
 
     assert result.status == "PASSED"
     assert result.pairs == 2
-    assert (output / "read_noise_summary.csv").is_file()
-    assert (output / "dataset_characterization.json").is_file()
-    assert (output / "temporal_noise_map.fits").is_file()
+
+    expected_outputs = {
+        "frame_level.csv",
+        "pair_noise_values.csv",
+        "pair_value_levels.csv",
+        "read_noise_summary.csv",
+        "read_noise_summary.json",
+        "dataset_characterization.json",
+        "read_noise_report.txt",
+        "frame_level_drift.png",
+        "pair_noise_by_pair.png",
+        "pair_rejected_fraction_by_pair.png",
+        "pair_difference_histogram.png",
+        "pair_difference_histogram_log.png",
+        "pair_difference_histogram_full_range_log.png",
+        "temporal_noise_map.png",
+        "temporal_noise_map.fits",
+        "pair_difference_0000.fits",
+        "temporal_noise_histogram.png",
+        "temporal_noise_histogram_log.png",
+    }
+    assert expected_outputs.issubset(
+        {path.name for path in output.iterdir()}
+    )
 
     characterization = read_dataset_characterization(
         output / "dataset_characterization.json"
@@ -88,6 +109,14 @@ def test_read_noise_outputs(tmp_path: Path) -> None:
     assert characterization.temporal_noise_median_adu_rms == (
         result.temporal_noise_median_adu_rms
     )
+
+    direct = characterize_dataset(
+        group,
+        ReadNoiseConfig(
+            output_dir=tmp_path / "direct_characterization",
+        ),
+    )
+    assert characterization == direct
     assert (
         output / "pair_difference_histogram_full_range_log.png"
     ).is_file()
